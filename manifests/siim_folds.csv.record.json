@@ -1,0 +1,17 @@
+{
+  "PYTHONHASHSEED": null,
+  "created_utc": "2026-11-23T18:58:02.577109+00:00",
+  "csv": "manifests/siim_folds.csv",
+  "csv_sha256": "f28db79a22499e447fb50830ce06c04f94cb857ebf09e5aa656e0fe3e6c4ee4b",
+  "item": "PTX-16 (Section 4.1) SIIM stratified fold manifest",
+  "k_folds": 5,
+  "n_images": 9607,
+  "n_positive": 2141,
+  "numpy_version": "1.24.4",
+  "pandas_version": "2.0.3",
+  "python_executable": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/.venv/bin/python3",
+  "python_version": "3.8.20",
+  "seed": 42,
+  "source_split": "ChestXrayDataset(split='train'), author train_test_split",
+  "torch_version": "2.1.0"
+}

@@ -735,7 +735,7 @@ def test_siim_masked_loader_negative_row_has_empty_mask(tmp_path, monkeypatch):
 # -------------------------------------------------------------------- PTX-498
 
 
-def test_ptx498_mask_is_native_binary_and_rotated_like_the_image(tmp_path, monkeypatch):
+def test_ptx498_mask_is_native_binary_and_oriented_like_the_image(tmp_path, monkeypatch):
     root = tmp_path / "ptx498"
     for site in ["A", "B", "C"]:
         site_dir = root / f"Site{site}"
@@ -755,16 +755,70 @@ def test_ptx498_mask_is_native_binary_and_rotated_like_the_image(tmp_path, monke
     index = dataset.image_ids.index("A_1")
     item = dataset[index]
 
-    expected = torch.rot90(
-        torch.from_numpy((mask > 0).astype(np.uint8)), 1, dims=(0, 1)
-    ).numpy()
+    # §9.1: author rot90 + horizontal flip (last axis) = np.fliplr(np.rot90(raw)).
+    expected = np.fliplr(np.rot90((mask > 0).astype(np.uint8), 1))
     assert item["mask"].dtype == np.uint8
     assert item["mask"].shape == (4, 4)  # native grid, not the 2x2 input size
     assert set(np.unique(item["mask"]).tolist()) == {0, 1}
     assert np.array_equal(item["mask"], expected)
     assert int(item["mask"].sum()) == 4
+    assert int(item["mask"][:, 2].sum()) == 4  # the raw row moved to a column
     assert item["image_id"] == item["pid"] == "A_1"
     assert tuple(item["data"].shape) == (1, 2, 2)
+
+
+
+def test_ptx498_orientation_is_rot90_plus_horizontal_flip(tmp_path, monkeypatch):
+    """§9.1: author rot90 + horizontal flip (last axis), for image and mask together."""
+    root = tmp_path / "ptx498"
+    for site in ["A", "B", "C"]:
+        site_dir = root / f"Site{site}"
+        site_dir.mkdir(parents=True)
+        (site_dir / "1.4.img.nii.gz").write_bytes(b"")
+        (site_dir / "1.5.mask.nii.gz").write_bytes(b"")
+
+    # Non-square raw arrays with a marker in one corner: square grids and axis-0 flips
+    # would both slip through a looser comparison.
+    image = np.zeros((4, 6), dtype=np.float32)
+    image[0, 5] = 1000.0  # raw top-right corner
+    mask = np.zeros((4, 6), dtype=np.float32)
+    mask[1, 4] = 255.0
+
+    def fake_load(path):
+        return FakeNifti(mask if str(path).endswith("5.mask.nii.gz") else image)
+
+    monkeypatch.setattr(ptx498.nib, "load", fake_load)
+
+    # The shared helper is np.fliplr(np.rot90(raw)) on the last two axes.
+    raw = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    assert np.array_equal(
+        ptx498.orient_ptx498(raw).numpy(), np.fliplr(np.rot90(raw.numpy(), 1))
+    )
+    assert not torch.equal(ptx498.orient_ptx498(raw), raw.transpose(-2, -1))
+
+    # No resize in the image path, so the comparison is exact at the raw grid.
+    dataset = ptx498.OODTestDataset(
+        root_dir=str(root),
+        img_size=8,
+        transform=transforms.Compose([transforms.ToTensor()]),
+    )
+    item = dataset[dataset.image_ids.index("A_1")]
+
+    expected_mask = np.fliplr(np.rot90((mask > 0).astype(np.uint8), 1))
+    assert item["mask"].shape == (6, 4)  # non-square grid rotated
+    assert np.array_equal(item["mask"], expected_mask)
+    assert set(np.unique(item["mask"]).tolist()) == {0, 1}
+    assert int(item["mask"][1, 2]) == 1  # raw (1, 4) -> (1, 2)
+
+    expected_image = torch.from_numpy(
+        np.ascontiguousarray(np.fliplr(np.rot90(minmax_per_image(image), 1)))
+    )
+    assert tuple(item["data"].shape) == (1, 6, 4)
+    assert torch.equal(item["data"][0], expected_image)
+    peak = np.unravel_index(
+        int(torch.argmax(item["data"]).item()), item["data"].shape[1:]
+    )
+    assert peak == (0, 3)  # raw (0, 5) -> (0, 3)
 
 
 def test_ptx498_image_id_order_is_deterministic(tmp_path, monkeypatch):

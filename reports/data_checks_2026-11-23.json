@@ -1,0 +1,288 @@
+{
+  "date": "2026-11-23",
+  "generated_at_utc": "2026-11-23T18:56:57+00:00",
+  "repo_root": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters",
+  "script": "sharpness_matters/ptx/corrected/data_checks.py",
+  "samples_per_group": 5,
+  "roots": {
+    "siim": "/Users/enesdemir/Documents/ap_articles/data/siim-acr",
+    "vindr": "/path/to/your/datasets",
+    "ptx498": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix"
+  },
+  "roots_present": {
+    "siim": true,
+    "vindr": false,
+    "ptx498": true
+  },
+  "checks": [
+    {
+      "id": "9.2",
+      "title": "PTX-498 mask values (row 9.2)",
+      "status": "NO CHANGE NEEDED (evidence: all 498 mask files hold only values 0 and 1)",
+      "code": "NO CHANGE NEEDED",
+      "summary": [
+        "mask files: 498; distinct values: 2",
+        "top values: 0 x 496336119, 1 x 25854729",
+        "every mask value is 0 or 1"
+      ],
+      "data": {
+        "root": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix",
+        "n_mask_files": 498,
+        "binarisation": "stage-2 loaders use `mask > 0` (contract module 6)",
+        "n_non_binary_files": 0,
+        "non_binary_files": [],
+        "n_unreadable_files": 0,
+        "unreadable_files": [],
+        "value_counts": [
+          {
+            "value": "0",
+            "pixels": 496336119
+          },
+          {
+            "value": "1",
+            "pixels": 25854729
+          }
+        ],
+        "total_pixels": 522190848
+      }
+    },
+    {
+      "id": "9.3a",
+      "title": "SIIM-ACR PhotometricInterpretation (row 9.3a)",
+      "status": "NO CHANGE NEEDED (evidence: 0 of 10712 file(s) are MONOCHROME1)",
+      "code": "NO CHANGE NEEDED",
+      "summary": [
+        "distribution: MONOCHROME2 x 10712",
+        "no MONOCHROME1 image"
+      ],
+      "data": {
+        "root": "/Users/enesdemir/Documents/ap_articles/data/siim-acr",
+        "dataset": "SIIM-ACR",
+        "pattern": "dicom-images-train/*/*/*.dcm",
+        "n_dicom_files": 10712,
+        "distribution": [
+          {
+            "photometric_interpretation": "MONOCHROME2",
+            "n_files": 10712
+          }
+        ],
+        "monochrome1_count": 0,
+        "monochrome1_ids": [],
+        "monochrome1_ids_truncated": 0,
+        "missing_tag_count": 0,
+        "missing_tag_ids": [],
+        "n_unreadable": 0,
+        "unreadable_files": []
+      }
+    },
+    {
+      "id": "9.3a",
+      "title": "VinDr PhotometricInterpretation (row 9.3a)",
+      "status": "NOT RUN (path missing)",
+      "code": "NOT RUN",
+      "summary": [
+        "root not found: /path/to/your/datasets",
+        "nothing was inspected for this check; this is not a pass"
+      ],
+      "data": {
+        "root": "/path/to/your/datasets"
+      }
+    },
+    {
+      "id": "9.3b",
+      "title": "VinDr bit depth: unmodified vs forced BitsStored=16 (row 9.3b)",
+      "status": "NOT RUN (path missing)",
+      "code": "NOT RUN",
+      "summary": [
+        "root not found: /path/to/your/datasets",
+        "nothing was inspected for this check; this is not a pass"
+      ],
+      "data": {
+        "root": "/path/to/your/datasets"
+      }
+    },
+    {
+      "id": "9.4-SIIM",
+      "title": "SIIM-ACR ImageId -> DICOM mapping and author split (row 9.4)",
+      "status": "NO CHANGE NEEDED (evidence: 10675 labelled ImageIds, one file each; split 9607/1068 and test 238/830 match)",
+      "code": "NO CHANGE NEEDED",
+      "summary": [
+        "observed: labelled_ids=10675, dev_ids=9607, test_ids=1068, test_pos=238, test_neg=830",
+        "expected: labelled_ids=10675, dev_ids=9607, test_ids=1068, test_pos=238, test_neg=830",
+        "DICOM files: 10712 (pattern 'dicom-images-train/*/*/*.dcm'); unique stems: 10712",
+        "every labelled ImageId maps to exactly one file; counts match"
+      ],
+      "data": {
+        "root": "/Users/enesdemir/Documents/ap_articles/data/siim-acr",
+        "dicom_pattern": "dicom-images-train/*/*/*.dcm",
+        "n_dicom_files": 10712,
+        "rle_csv": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/train-rle.csv",
+        "expected": {
+          "labelled_ids": 10675,
+          "dev_ids": 9607,
+          "test_ids": 1068,
+          "test_pos": 238,
+          "test_neg": 830
+        },
+        "observed": {
+          "labelled_ids": 10675,
+          "dev_ids": 9607,
+          "test_ids": 1068,
+          "test_pos": 238,
+          "test_neg": 830
+        },
+        "mismatches": [],
+        "n_missing_files": 0,
+        "missing_examples": [],
+        "n_duplicate_image_ids": 0,
+        "duplicate_examples": [],
+        "n_unique_file_stems": 10712,
+        "label_rule_disagreements": 0,
+        "split": "train_test_split(test_size=0.1, random_state=42)"
+      }
+    },
+    {
+      "id": "GT-EMPTY",
+      "title": "Positive images with an empty GT mask (saliency K1 guard)",
+      "status": "NO CHANGE NEEDED (evidence: 0 empty GT masks in 498 PTX-498 mask(s) and 2379 SIIM positive ImageId(s))",
+      "code": "NO CHANGE NEEDED",
+      "summary": [
+        "inspected datasets: ptx498, siim",
+        "ptx498: 0 empty GT mask(s) of 498 mask(s)",
+        "siim: 0 empty GT mask(s) of 2379 positive ImageId(s)",
+        "PTX-498 example ids: none",
+        "SIIM example ids: none",
+        "no positive image has an empty GT mask"
+      ],
+      "data": {
+        "datasets": {
+          "ptx498": {
+            "root": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix",
+            "available": true,
+            "n_masks": 498,
+            "n_empty": 0,
+            "empty_ids": [],
+            "empty_ids_truncated": 0,
+            "n_unreadable": 0,
+            "unreadable_files": []
+          },
+          "siim": {
+            "root": "/Users/enesdemir/Documents/ap_articles/data/siim-acr",
+            "available": true,
+            "rle_csv": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/train-rle.csv",
+            "n_positive_ids": 2379,
+            "n_empty": 0,
+            "empty_ids": [],
+            "empty_ids_truncated": 0,
+            "n_malformed": 0,
+            "malformed_masks": []
+          }
+        },
+        "n_empty_total": 0,
+        "b_item": "7.4",
+        "scoring_effect": "score_saliency raises RuntimeError when a GT-positive image has an empty reference-grid mask (saliency_eval.py, PTX-04 / Section 7.4)"
+      }
+    },
+    {
+      "id": "9.1",
+      "title": "PTX-498 orientation vs SIIM (row 9.1, human decision)",
+      "status": "OPEN (human visual decision required)",
+      "code": "OPEN",
+      "summary": [
+        "overlay files: 5 (5 PTX-498, 5 SIIM)",
+        "the human compares the two columns and records the decision in the report",
+        "no automatic orientation/mirroring decision is made"
+      ],
+      "data": {
+        "dir": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays",
+        "n_ptx498": 5,
+        "n_siim": 5,
+        "files": [
+          "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_01.png",
+          "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_02.png",
+          "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_03.png",
+          "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_04.png",
+          "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_05.png"
+        ],
+        "items": [
+          {
+            "file": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_01.png",
+            "ptx498_id": "SiteA/1",
+            "ptx498_image": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/1.4.img.nii.gz",
+            "ptx498_mask": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/1.5.mask.nii.gz",
+            "ptx_mask_resized": false,
+            "siim_id": "1.2.276.0.7230010.3.1.4.8323329.4904.1517875185.355709",
+            "siim_image": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/dicom-images-train/1.2.276.0.7230010.3.1.2.8323329.4904.1517875185.355708/1.2.276.0.7230010.3.1.3.8323329.4904.1517875185.355707/1.2.276.0.7230010.3.1.4.8323329.4904.1517875185.355709.dcm",
+            "siim_mask_resized": false,
+            "error": null
+          },
+          {
+            "file": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_02.png",
+            "ptx498_id": "SiteA/10",
+            "ptx498_image": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/10.4.img.nii.gz",
+            "ptx498_mask": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/10.5.mask.nii.gz",
+            "ptx_mask_resized": false,
+            "siim_id": "1.2.276.0.7230010.3.1.4.8323329.32579.1517875161.299312",
+            "siim_image": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/dicom-images-train/1.2.276.0.7230010.3.1.2.8323329.32579.1517875161.299311/1.2.276.0.7230010.3.1.3.8323329.32579.1517875161.299310/1.2.276.0.7230010.3.1.4.8323329.32579.1517875161.299312.dcm",
+            "siim_mask_resized": false,
+            "error": null
+          },
+          {
+            "file": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_03.png",
+            "ptx498_id": "SiteA/100",
+            "ptx498_image": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/100.4.img.nii.gz",
+            "ptx498_mask": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/100.5.mask.nii.gz",
+            "ptx_mask_resized": false,
+            "siim_id": "1.2.276.0.7230010.3.1.4.8323329.1314.1517875167.222290",
+            "siim_image": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/dicom-images-train/1.2.276.0.7230010.3.1.2.8323329.1314.1517875167.222289/1.2.276.0.7230010.3.1.3.8323329.1314.1517875167.222288/1.2.276.0.7230010.3.1.4.8323329.1314.1517875167.222290.dcm",
+            "siim_mask_resized": false,
+            "error": null
+          },
+          {
+            "file": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_04.png",
+            "ptx498_id": "SiteA/101",
+            "ptx498_image": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/101.4.img.nii.gz",
+            "ptx498_mask": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/101.5.mask.nii.gz",
+            "ptx_mask_resized": false,
+            "siim_id": "1.2.276.0.7230010.3.1.4.8323329.4440.1517875182.865105",
+            "siim_image": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/dicom-images-train/1.2.276.0.7230010.3.1.2.8323329.4440.1517875182.865104/1.2.276.0.7230010.3.1.3.8323329.4440.1517875182.865103/1.2.276.0.7230010.3.1.4.8323329.4440.1517875182.865105.dcm",
+            "siim_mask_resized": false,
+            "error": null
+          },
+          {
+            "file": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays/overlay_05.png",
+            "ptx498_id": "SiteA/102",
+            "ptx498_image": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/102.4.img.nii.gz",
+            "ptx498_mask": "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix/SiteA/102.5.mask.nii.gz",
+            "ptx_mask_resized": false,
+            "siim_id": "1.2.276.0.7230010.3.1.4.8323329.4982.1517875185.837576",
+            "siim_image": "/Users/enesdemir/Documents/ap_articles/data/siim-acr/dicom-images-train/1.2.276.0.7230010.3.1.2.8323329.4982.1517875185.837575/1.2.276.0.7230010.3.1.3.8323329.4982.1517875185.837574/1.2.276.0.7230010.3.1.4.8323329.4982.1517875185.837576.dcm",
+            "siim_mask_resized": false,
+            "error": null
+          }
+        ]
+      }
+    }
+  ],
+  "status_counts": {
+    "ISSUE": 0,
+    "NO CHANGE NEEDED": 4,
+    "OPEN": 1,
+    "NOT RUN": 2
+  },
+  "b_item_note": "B items are the Section 9 rows of baseline_correction.md; '9.4-SIIM' is the SIIM ImageId -> file mapping row of the Section 9.4 table.",
+  "environment": {
+    "python": "3.8.20",
+    "pydicom": "2.4.0",
+    "numpy": "1.24.4",
+    "pandas": "2.0.3",
+    "scikit_learn": "1.3.2",
+    "nibabel": "5.2.1"
+  },
+  "overlay_dir": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays",
+  "outputs": {
+    "markdown": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23.md",
+    "json": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23.json",
+    "overlay_dir": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/reports/data_checks_2026-11-23_overlays"
+  }
+}

@@ -9,8 +9,6 @@ import glob
 import pandas as pd
 from tqdm import tqdm
 import cv2
-from torchvision import transforms
-import pickle
 import nibabel as nib
 from typing import Dict, Any, Tuple, Union, List, Optional
 
@@ -20,6 +18,26 @@ from sharpness_matters.config.load_config import cfg
 
 HOME = Path(__file__).resolve().parent.parent
 logger = initialize_logger(level="info")
+
+
+def orient_ptx498(tensor: torch.Tensor) -> torch.Tensor:
+    """Put a PTX-498 image or mask into the dataset's frame (last two axes).
+
+    The author rotates the NIfTI array by 90 degrees; that keeps up/down but mirrors
+    left/right against the dataset's own PNG (readable "R" on the image left). The
+    dataset frame is the author's rotation followed by a horizontal flip (last axis,
+    i.e. ``np.fliplr`` of the rotated array), which matches the PNG for every image in
+    the real-data check. Image and mask both go through this one helper so they cannot
+    diverge.
+
+    # B (§9.1 / Y6): author rot90 mirrors left-right vs the dataset PNG (497/498
+    # author-mirrored; fixed helper matches 498/498; reports/tools/corr.py) ->
+    # rot90 + horizontal flip (last axis) for image and mask
+    #   check: tests/corrected/test_data.py::test_ptx498_orientation_is_rot90_plus_horizontal_flip
+    """
+    rotated = torch.rot90(tensor, k=1, dims=(-2, -1))
+    return torch.flip(rotated, dims=(-1,))
+
 
 
 class OODTestDataset(Dataset):
@@ -40,8 +58,10 @@ class OODTestDataset(Dataset):
         #   image is scaled per image with min-max. # B (PTX-26 / Section 5.3): the
         #   default preprocessing is the shared eval_transform policy. # B (PTX-02 /
         #   Section 7.1): the mask stays on the native NIfTI grid (no resize, no
-        #   *255, uint8 {0,1}) and is rotated exactly like the image.
-        #   check: tests/corrected/test_data.py::test_ptx498_mask_*
+        #   *255, uint8 {0,1}). # B (§9.1 / Y6): image and mask go through the same
+        #   orientation helper (author rot90 + horizontal flip on the last axis); the
+        #   author's rot90 alone mirrored left/right vs the dataset PNG.
+        #   check: tests/corrected/test_data.py::test_ptx498_*
 
         Args:
             root_dir (str): Root directory containing Site folders with NIfTI files
@@ -160,14 +180,11 @@ class OODTestDataset(Dataset):
         image = np.expand_dims(image, -1)
         image = minmax_per_image(image)
         image = self.transform(image)  # eval_transform: ToTensor -> Resize
-        # For some reason, the images and masks were rotated by 90 degrees in the
-        # original dataset. The author rotation is kept unchanged; whether it (and a
-        # possible mirroring) matches the SIIM orientation is an open data check
-        # (Section 9.1). §5 keeps image and mask on the same rotation: the image uses
-        # functional.rotate(90), which equals torch.rot90(k=1) on a square grid; the
-        # mask is rotated with rot90 so a non-square native grid is not cropped.
-        image = transforms.functional.rotate(image, angle=90)
-        mask = torch.rot90(torch.from_numpy(mask), k=1, dims=(0, 1)).numpy()
+        # §9.1 decided: the author's rot90 alone mirrors left/right vs the dataset PNG.
+        # B applies the mirror fix through the shared helper, for image and mask
+        # together (rot90 + horizontal flip on the last axis).
+        image = orient_ptx498(image)
+        mask = orient_ptx498(torch.from_numpy(mask)).numpy()
         return {
             "data": image,
             "mask": mask,
