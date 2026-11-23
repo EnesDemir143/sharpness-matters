@@ -1,0 +1,17 @@
+image_id,split,patient_id,path,label
+patient64547_study1_view1_frontal,val,patient64547,val/patient64547/study1/view1_frontal.jpg,1
+patient64547_study1_view2_frontal,val,patient64547,val/patient64547/study1/view2_frontal.jpg,1
+patient64602_study1_view1_frontal,val,patient64602,val/patient64602/study1/view1_frontal.jpg,1
+patient64604_study1_view1_frontal,val,patient64604,val/patient64604/study1/view1_frontal.jpg,1
+patient64643_study1_view1_frontal,val,patient64643,val/patient64643/study1/view1_frontal.jpg,1
+patient64679_study1_view1_frontal,val,patient64679,val/patient64679/study1/view1_frontal.jpg,1
+patient64711_study1_view1_frontal,val,patient64711,val/patient64711/study1/view1_frontal.jpg,1
+patient64837_study1_view1_frontal,test,patient64837,test/patient64837/study1/view1_frontal.jpg,1
+patient64858_study1_view1_frontal,test,patient64858,test/patient64858/study1/view1_frontal.jpg,1
+patient64904_study1_view1_frontal,test,patient64904,test/patient64904/study1/view1_frontal.jpg,1
+patient64938_study1_view1_frontal,test,patient64938,test/patient64938/study1/view1_frontal.jpg,1
+patient64982_study1_view1_frontal,test,patient64982,test/patient64982/study1/view1_frontal.jpg,1
+patient64987_study1_view1_frontal,test,patient64987,test/patient64987/study1/view1_frontal.jpg,1
+patient65091_study1_view1_frontal,test,patient65091,test/patient65091/study1/view1_frontal.jpg,1
+patient65119_study1_view1_frontal,test,patient65119,test/patient65119/study1/view1_frontal.jpg,1
+patient65196_study1_view1_frontal,test,patient65196,test/patient65196/study1/view1_frontal.jpg,1

@@ -1,0 +1,77 @@
+{
+  "PYTHONHASHSEED": null,
+  "counts": {
+    "combined": {
+      "images": 720,
+      "laterals_excluded": 182,
+      "masks_without_positive_label": 0,
+      "negatives": 704,
+      "nonempty_masks": 18,
+      "nonempty_masks_outside_xai": 2,
+      "patients": 700,
+      "positives": 16,
+      "positives_without_mask": 0,
+      "rows_seen": 902,
+      "uncertain_excluded": 0,
+      "xai_images": 16,
+      "xai_patients": 15
+    },
+    "test": {
+      "annotations_json": "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXlocalize/gt_segmentations_test.json",
+      "images": 518,
+      "label_column": "Pneumothorax",
+      "labels_csv": "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXpert/test_labels.csv",
+      "laterals_excluded": 150,
+      "masks_without_positive_label": 0,
+      "negatives": 509,
+      "nonempty_masks": 10,
+      "nonempty_masks_outside_xai": 1,
+      "patients": 500,
+      "positives": 9,
+      "positives_without_mask": 0,
+      "rows_seen": 668,
+      "uncertain_excluded": 0,
+      "xai_images": 9,
+      "xai_patients": 9
+    },
+    "val": {
+      "annotations_json": "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXlocalize/gt_segmentations_val.json",
+      "images": 202,
+      "label_column": "Pneumothorax",
+      "labels_csv": "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXpert/val_labels.csv",
+      "laterals_excluded": 32,
+      "masks_without_positive_label": 0,
+      "negatives": 195,
+      "nonempty_masks": 8,
+      "nonempty_masks_outside_xai": 1,
+      "patients": 200,
+      "positives": 7,
+      "positives_without_mask": 0,
+      "rows_seen": 234,
+      "uncertain_excluded": 0,
+      "xai_images": 7,
+      "xai_patients": 6
+    }
+  },
+  "created_utc": "2026-11-23T19:59:43.841028+00:00",
+  "csv": "manifests/chexlocalize_cls.csv",
+  "csv_sha256": "d4660de67b8fce09ac02c982398edc73a4a2261ea8a82f1b9bbc9bc10c98c2a8",
+  "item": "E4 CheXlocalize cls manifest (protocol Section 4.4)",
+  "label_column": "Pneumothorax",
+  "numpy_version": "1.24.4",
+  "pandas_version": "2.0.3",
+  "python_executable": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/.venv/bin/python3",
+  "python_version": "3.8.20",
+  "rule": "frontal views with CheXpert Pneumothorax in {0,1}",
+  "source_sha256": {
+    "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXlocalize/gt_segmentations_test.json": "f731185d99b64cbd21d67aa276369c9cfce85571dbe65836ddc37cd5999d905d",
+    "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXlocalize/gt_segmentations_val.json": "6cf456d8709c100102111f375c1cc1e9a4809a819a7b0fd613036d2561efa190",
+    "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXpert/test_labels.csv": "d4c8b7ed95c3b2f78d82f92243609042a2ee4014b8bfe029bd572b093fc311a9",
+    "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXpert/val_labels.csv": "7739f6850dc581938aebe13ccc1931e6d980cf7e981cbcd255068b3aac3ef442"
+  },
+  "splits": [
+    "val",
+    "test"
+  ],
+  "torch_version": "2.1.0"
+}

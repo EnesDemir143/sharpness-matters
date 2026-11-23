@@ -6,8 +6,8 @@ ptx:
       test_root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/test"  # E2: PhysioNet VinDr-CXR official test DICOMs (3,000); images not downloaded yet
       test_labels_csv: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/annotations/image_labels_test.csv"  # E2: 5-radiologist consensus image labels
   chexlocalize:  # E4 (complementary external classification + XAI)
-      annotations_dir: "/Users/enesdemir/Documents/ap_articles/data/CheXlocalize_files"  # gt_segmentations_{val,test}.json
-      chexpert_dir: "/path/to/CheXlocalize/CheXpert"  # val/, test/, val_labels.csv, test_labels.csv (Stanford AIMI CheXlocalize download)
+      annotations_dir: "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXlocalize"  # gt_segmentations_{val,test}.json
+      chexpert_dir: "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXpert"  # val/, test/, val_labels.csv, test_labels.csv (Stanford AIMI CheXlocalize download)
   ptx498:
       root_dir: "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix"
   model:
