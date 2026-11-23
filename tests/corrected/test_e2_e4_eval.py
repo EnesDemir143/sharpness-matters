@@ -21,6 +21,7 @@ import pytorch_lightning as pl
 import torch
 from click.testing import CliRunner
 from pytorch_lightning import LightningModule
+from sklearn.metrics import roc_auc_score
 from torch import nn
 from torch.utils.data import Dataset
 
@@ -160,6 +161,18 @@ def _write_labels_csv(path: Path, rows) -> Path:
     return path
 
 
+def _write_wide_train_csv(path: Path, votes_by_image) -> Path:
+    """One row per (image_id, rad_id) vote, the shape of image_labels_train.csv."""
+    rows = []
+    for image_id, votes in votes_by_image.items():
+        for index, vote in enumerate(votes):
+            rows.append(
+                {"image_id": image_id, "rad_id": f"R{index + 1}", "Pneumothorax": vote}
+            )
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
 def _touch_dicoms(root: Path, image_ids) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     for image_id in image_ids:
@@ -205,6 +218,8 @@ def test_vindr_test_manifest_happy_path(tmp_path, monkeypatch):
     )
     assert (record["n"], record["n_pos"], record["n_neg"]) == (3, 2, 1)
     assert record["label_column"] == "Pneumothorax"
+    assert record["rule"] == make_vindr_test.TEST_RULE
+    assert record["labels_csv_sha256"] == _sha256(labels_csv)
     assert record["csv_sha256"] == _sha256(csv_path)
 
     # Load-first: with a frozen manifest present the builder is never called again.
@@ -240,8 +255,126 @@ def test_vindr_test_manifest_missing_dicom_raises(tmp_path):
     )
     test_root = _touch_dicoms(tmp_path / "vindr_test", ["a"])
 
-    with pytest.raises(FileNotFoundError, match=r"no <test_root>/<image_id>\.dicom") as error:
+    with pytest.raises(FileNotFoundError, match=r"no <root>/<image_id>\.dicom") as error:
         make_vindr_test.build_vindr_test_manifest(labels_csv, test_root)
+
+    assert "b" in str(error.value)
+
+
+# ------------------------------------------------------------------ E2-wide manifest
+
+WIDE_TRAIN_VOTES = {
+    "majority_pos": [1, 1, 0],  # 2 votes -> label 1, label_any 1
+    "single_vote": [1, 0, 0],  # 1 vote  -> label 0, label_any 1
+    "all_votes": [1, 1, 1],  # 3 votes -> label 1, label_any 1
+    "negative": [0, 0, 0],  # 0 votes -> label 0, label_any 0
+}
+WIDE_TEST_ROWS = [("test_pos", 1), ("test_neg", 0)]
+
+
+def _wide_tmp_inputs(tmp_path):
+    train_csv = _write_wide_train_csv(
+        tmp_path / "image_labels_train.csv", WIDE_TRAIN_VOTES
+    )
+    test_csv = _write_labels_csv(
+        tmp_path / "image_labels_test.csv", WIDE_TEST_ROWS
+    )
+    train_root = _touch_dicoms(tmp_path / "train", WIDE_TRAIN_VOTES)
+    test_root = _touch_dicoms(
+        tmp_path / "test", [image_id for image_id, _ in WIDE_TEST_ROWS]
+    )
+    return train_csv, test_csv, train_root, test_root
+
+
+def test_vindr_wide_manifest_rules_and_counts(tmp_path, monkeypatch):
+    train_csv, test_csv, train_root, test_root = _wide_tmp_inputs(tmp_path)
+
+    frame = make_vindr_test.build_vindr_wide_manifest(
+        train_csv, test_csv, train_root, test_root
+    )
+
+    assert list(frame.columns) == make_vindr_test.WIDE_COLUMNS
+    assert list(frame["split"]) == ["train"] * 4 + ["test"] * 2
+    assert list(frame["image_id"]) == list(WIDE_TRAIN_VOTES) + ["test_pos", "test_neg"]
+    # MAIN rule: >= 2 of 3 votes; SENSITIVITY rule: >= 1 vote.
+    assert list(frame["label"]) == [1, 0, 1, 0, 1, 0]
+    assert list(frame["label_any"]) == [1, 1, 1, 0, 1, 0]
+    assert list(frame["n_readers"]) == [3, 3, 3, 3, 5, 5]
+    assert list(frame["n_pos_votes"]) == [2, 1, 3, 0, 1, 0]
+    assert make_vindr_test.wide_manifest_counts(frame) == {
+        "train": {"n": 4, "label_pos": 2, "label_any_pos": 3},
+        "test": {"n": 2, "label_pos": 1, "label_any_pos": 1},
+        "total": {"n": 6, "label_pos": 3, "label_any_pos": 4},
+    }
+
+    # Freeze through the public loader, with config pointing at the tmp files.
+    manifests = tmp_path / "manifests"
+    monkeypatch.setattr(make_vindr_test, "manifest_dir", lambda: manifests)
+    monkeypatch.setattr(cfg.ptx.vindr, "test_labels_csv", str(test_csv))
+    monkeypatch.setattr(cfg.ptx.vindr, "root_dir", str(train_root))
+    monkeypatch.setattr(cfg.ptx.vindr, "test_root_dir", str(test_root))
+
+    frozen = make_vindr_test.load_vindr_wide_manifest()
+
+    assert frozen.equals(frame)
+    record = json.loads(
+        (manifests / "vindr_wide.csv.record.json").read_text(encoding="utf-8")
+    )
+    assert record["main_rule"] == make_vindr_test.WIDE_MAIN_RULE
+    assert record["sensitivity_rule"] == make_vindr_test.WIDE_SENSITIVITY_RULE
+    assert record["train_labels_csv"] == str(train_csv)
+    # The train path is derived from the test label path, never a config key.
+    assert record["test_labels_csv"] == str(test_csv)
+    assert record["train_labels_csv_sha256"] == _sha256(train_csv)
+    assert record["test_labels_csv_sha256"] == _sha256(test_csv)
+    assert record["counts"] == make_vindr_test.wide_manifest_counts(frame)
+    assert record["counts"]["total"] == {"n": 6, "label_pos": 3, "label_any_pos": 4}
+
+    # Load-first: a frozen wide manifest is never rebuilt.
+    monkeypatch.setattr(make_vindr_test, "build_vindr_wide_manifest", _explode)
+    assert make_vindr_test.load_vindr_wide_manifest().equals(frame)
+
+
+def test_vindr_wide_reader_count_raises(tmp_path):
+    train_csv = _write_wide_train_csv(
+        tmp_path / "image_labels_train.csv", {"a": [1, 0], "b": [1, 1, 0]}
+    )
+    test_csv = _write_labels_csv(tmp_path / "image_labels_test.csv", [("t", 0)])
+
+    with pytest.raises(ValueError, match="exactly 3 reader rows") as error:
+        make_vindr_test.build_vindr_wide_manifest(
+            train_csv, test_csv, tmp_path / "train", tmp_path / "test"
+        )
+
+    assert "a: 2" in str(error.value)
+
+
+def test_vindr_wide_split_overlap_raises(tmp_path):
+    train_csv = _write_wide_train_csv(
+        tmp_path / "image_labels_train.csv", {"shared": [1, 1, 1]}
+    )
+    test_csv = _write_labels_csv(
+        tmp_path / "image_labels_test.csv", [("shared", 1)]
+    )
+
+    with pytest.raises(ValueError, match="disjoint"):
+        make_vindr_test.build_vindr_wide_manifest(
+            train_csv, test_csv, tmp_path / "train", tmp_path / "test"
+        )
+
+
+def test_vindr_wide_missing_dicom_raises(tmp_path):
+    train_csv = _write_wide_train_csv(
+        tmp_path / "image_labels_train.csv", {"a": [1, 1, 1], "b": [0, 0, 0]}
+    )
+    test_csv = _write_labels_csv(tmp_path / "image_labels_test.csv", [("t", 0)])
+    train_root = _touch_dicoms(tmp_path / "train", ["a"])
+    test_root = _touch_dicoms(tmp_path / "test", ["t"])
+
+    with pytest.raises(FileNotFoundError, match=r"VinDr train image") as error:
+        make_vindr_test.build_vindr_wide_manifest(
+            train_csv, test_csv, train_root, test_root
+        )
 
     assert "b" in str(error.value)
 
@@ -378,6 +511,104 @@ def test_chexlocalize_manifest_order_mismatch_raises(tmp_path):
         evaluate_kfold._chexlocalize_cohort_columns(manifest_csv, IDS)
 
 
+# ------------------------------------------------------------------ E2-wide eval path
+
+WIDE_LOGIT_BY_ID = {
+    "majority_pos": 2.0,
+    "single_vote": 1.5,
+    "all_votes": 1.0,
+    "negative": -2.0,
+    "test_pos": 1.0,
+    "test_neg": -1.0,
+}
+
+
+def _fake_wide_manifest() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "image_id": list(WIDE_LOGIT_BY_ID),
+            "split": ["train"] * 4 + ["test"] * 2,
+            "label": [1, 0, 1, 0, 1, 0],
+            "label_any": [1, 1, 1, 0, 1, 0],
+            "n_readers": [3, 3, 3, 3, 5, 5],
+            "n_pos_votes": [2, 1, 3, 0, 1, 0],
+        }
+    )
+
+
+def test_vindr_wide_mode_writes_both_labels(tmp_path, monkeypatch, ckpt_dir):
+    _write_record(ckpt_dir, FOLD_BIASES, tau=0.7)
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    # Only the hash prefix of the temp dir is taken from this file; contents are unused.
+    (manifests / "vindr_wide.csv").write_text(
+        "image_id,split,label,label_any,n_readers,n_pos_votes\n", encoding="utf-8"
+    )
+    wide = _fake_wide_manifest()
+    monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: manifests)
+    monkeypatch.setattr(evaluate_kfold, "HOME", tmp_path)
+    monkeypatch.setattr(evaluate_kfold, "load_vindr_wide_manifest", lambda: wide)
+    monkeypatch.setattr(evaluate_kfold, "CNNBinaryClassifier", TinyClassifier)
+    captured = []
+
+    def fake_vin(manifest_csv=None, root_dir=None, img_size=None, transform=None):
+        part = pd.read_csv(manifest_csv, dtype={"image_id": str})
+        image_ids = part["image_id"].tolist()
+        captured.append((manifest_csv, root_dir, image_ids))
+        return LogitDataset(
+            [WIDE_LOGIT_BY_ID[image_id] for image_id in image_ids],
+            part["label"].astype(int).tolist(),
+            ids=image_ids,
+        )
+
+    monkeypatch.setattr(evaluate_kfold, "VinDataset", fake_vin)
+
+    metrics = evaluate_kfold.fetch_results_per_resolution(
+        IMG_SIZE, MODEL_NAME, "vindr_wide"
+    )
+
+    # One dataset per split, each with its own DICOM root, in train -> test order.
+    assert [item[1] for item in captured] == [
+        str(cfg.ptx.vindr.root_dir),
+        str(cfg.ptx.vindr.test_root_dir),
+    ]
+    assert [item[2] for item in captured] == [
+        ["majority_pos", "single_vote", "all_votes", "negative"],
+        ["test_pos", "test_neg"],
+    ]
+    # The per-split csv views the loader needed are temporary and already removed.
+    assert all(not Path(item[0]).exists() for item in captured)
+
+    ids_csv = (
+        tmp_path
+        / "output"
+        / "classif_preds"
+        / f"vindr_widepred_{MODEL_NAME}_{IMG_SIZE}_ids.csv"
+    )
+    frame = pd.read_csv(ids_csv, dtype={"image_id": str})
+    assert list(frame.columns) == (
+        ["image_id", "source", "split", "label", "label_any", "prob"]
+        + [f"prob_fold{fold}" for fold in range(len(FOLD_BIASES))]
+    )
+    assert list(frame["image_id"]) == list(wide["image_id"])
+    assert list(frame["source"]) == ["vindr_wide_train"] * 4 + ["vindr_wide_test"] * 2
+    assert list(frame["split"]) == ["train"] * 4 + ["test"] * 2
+    assert list(frame["label"]) == [1, 0, 1, 0, 1, 0]
+    assert list(frame["label_any"]) == [1, 1, 1, 0, 1, 0]
+
+    # Both metric rows are recomputations of the SAME saved ensemble probability.
+    probs = frame["prob"].to_numpy()
+    main_labels = np.asarray(frame["label"], dtype=int)
+    any_labels = np.asarray(frame["label_any"], dtype=int)
+    assert metrics["auc"] == pytest.approx(round(roc_auc_score(main_labels, probs), 4))
+    block = metrics["sensitivity_label_any"]
+    assert block["auc"] == pytest.approx(round(roc_auc_score(any_labels, probs), 4))
+    assert block["n_pos"] == 4
+    assert block["n_neg"] == 2
+    assert len(block["auroc_ci"]) == 2
+    assert block["auroc_ci"][0] <= block["auroc_ci"][1]
+
+
 # -------------------------------------------------------------------------------- CLI
 
 
@@ -386,4 +617,5 @@ def test_cli_help_lists_e2_e4_modes():
 
     assert result.exit_code == 0
     assert "vindr_test" in result.output
+    assert "vindr_wide" in result.output
     assert "chexlocalize" in result.output

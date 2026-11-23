@@ -27,12 +27,22 @@ predictions are saved keyed by ImageId for further analysis.
 #   check: tests/corrected/test_e2_e4_eval.py::test_vindr_test_mode_writes_id_csv,
 #   ::test_chexlocalize_mode_keeps_split_and_patient_id,
 #   ::test_cli_help_lists_e2_e4_modes
+# B (§4.4 E2-wide, secondary row): current -> a single prediction file could only carry
+#   E2's one consensus label. New -> `vindr_wide` evaluates the frozen train+test wide
+#   manifest as one ConcatDataset (train root, test root) and writes both pre-registered
+#   labels (`label`, `label_any`) with the prediction, so the sensitivity AUROC comes
+#   from the same predictions under `sensitivity_label_any` instead of a second model
+#   run. The per-split `image_id,label` csv files the loader needs are temporary views
+#   of the frozen manifest and are never frozen themselves.
+#   check: tests/corrected/test_e2_e4_eval.py::test_vindr_wide_mode_writes_both_labels,
+#   ::test_vindr_wide_sensitivity_auroc_uses_same_predictions
 
 Usage:
     Run this module directly:
         python3 evaluate_kfold.py --validation_mode=<validation_dataset>
         python3 evaluate_kfold.py --validation_mode=ood_clean --e5_manifest=manifests/reference_like_clean.csv
         python3 evaluate_kfold.py --validation_mode=vindr_test   # E2
+        python3 evaluate_kfold.py --validation_mode=vindr_wide   # E2-wide (secondary)
         python3 evaluate_kfold.py --validation_mode=chexlocalize  # E4
     Output CSV files with evaluation metrics for each model will be saved in
     'classification_{model_name}_{validation_mode}.csv'.
@@ -40,6 +50,8 @@ Usage:
 
 import os
 import glob
+import shutil
+import tempfile
 import numpy as np
 import torch
 import pytorch_lightning as pl
@@ -48,7 +60,8 @@ import pandas as pd
 import sys
 import click
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, List, Optional, Tuple
+from sklearn.metrics import roc_auc_score
 
 from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
     ChestXrayDataset,
@@ -56,8 +69,20 @@ from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
 from sharpness_matters.ptx.datasets.vin_dataset import VinDataset
 from sharpness_matters.ptx.datasets.ptx498_dataset import OODTestDataset
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
-from sharpness_matters.ptx.corrected.frozen import manifest_dir
-from sharpness_matters.ptx.utils.classification_eval import eval_res
+from sharpness_matters.ptx.corrected.frozen import manifest_dir, sha256_file
+from sharpness_matters.ptx.corrected.make_chexlocalize import (
+    CLS_MANIFEST_NAME as CHEXLOCALIZE_CLS_MANIFEST,
+)
+from sharpness_matters.ptx.corrected.make_vindr_test import (
+    MANIFEST_NAME as VINDR_TEST_MANIFEST,
+    WIDE_MANIFEST_NAME as VINDR_WIDE_MANIFEST,
+    WIDE_SPLITS,
+    load_vindr_wide_manifest,
+)
+from sharpness_matters.ptx.utils.classification_eval import (
+    auroc_confidence_interval,
+    eval_res,
+)
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
 from sharpness_matters.config.load_config import cfg
 
@@ -66,15 +91,13 @@ DATA_DIR = cfg.ptx.siim_acr.root_dir
 HOME = Path(__file__).resolve().parent.parent
 logger.debug(f"Output Root: {HOME}")
 
-# Manifest names live in their builders (make_vindr_test / make_chexlocalize); the
-# evaluator only reads the frozen csv, so the names are mirrored here (§4.4 E2/E4).
-VINDR_TEST_MANIFEST = "vindr_test.csv"
-CHEXLOCALIZE_CLS_MANIFEST = "chexlocalize_cls.csv"
+# Manifest names come from their builders (single source of truth, §4.4 E2/E2-wide/E4).
 VALIDATION_MODES = (
     "holdout",
     "ood_reference_like",
     "ood_clean",
     "vindr_test",
+    "vindr_wide",
     "chexlocalize",
 )
 
@@ -133,16 +156,20 @@ def fetch_results_per_resolution(
         img_size (int): Input image size for model evaluation
         model_name (str): Model architecture ('resnet' or 'densenet')
         validation_mode (str): Validation dataset ('holdout', 'ood_reference_like',
-            'ood_clean', 'vindr_test' or 'chexlocalize'); the E5 variants are separate
-            runs with separate manifests, E2/E4 read their own frozen manifests.
+            'ood_clean', 'vindr_test', 'vindr_wide' or 'chexlocalize'); the E5 variants
+            are separate runs with separate manifests, E2/E2-wide/E4 read their own
+            frozen manifests.
         e5_manifest (str): ID+label manifest of the E5 run (required for the E5 modes;
-            unused by E2/E4, whose cohorts come from their frozen manifests)
+            unused by E2/E2-wide/E4, whose cohorts come from their frozen manifests)
 
     Returns:
-        Dict[str, Any]: Dictionary containing evaluation metrics
+        Dict[str, Any]: Dictionary containing evaluation metrics; `vindr_wide` adds the
+            `sensitivity_label_any` AUROC block computed from the same predictions.
     """
-    # Extra ID-keyed columns beyond `source`; the E4 CSV keeps split and patient_id.
-    extra_columns: Dict[str, list] = {}
+    # Extra ID-keyed prediction columns as (insert position, name, values); position
+    # None appends. The E2-wide row pins split/label_any between source and label.
+    extra_columns: List[Tuple[Optional[int], str, list]] = []
+    label_any_labels: Optional[np.ndarray] = None
     # Extract training files required to initialize dataset
     if validation_mode == "holdout":
         train_dicom_dir = os.path.join(DATA_DIR, "dicom-images-train")
@@ -192,11 +219,63 @@ def fetch_results_per_resolution(
         ids = list(dataset.image_ids)
         expected = [int(dataset.labels[i]) for i in ids]
         cohort = _chexlocalize_cohort_columns(manifest_csv, ids)
-        extra_columns = {
-            "split": cohort["split"],
-            "patient_id": cohort["patient_id"],
-        }
+        extra_columns = [
+            (None, "split", cohort["split"]),
+            (None, "patient_id", cohort["patient_id"]),
+        ]
         sources = [f"chexlocalize_{split}" for split in cohort["split"]]
+    elif validation_mode == "vindr_wide":
+        # B (§4.4 E2-wide): secondary row next to E2. One frozen wide manifest carries
+        # both pre-registered labels; VinDataset needs one ID+label csv per root, so the
+        # per-split views are written to a temporary dir (never frozen separately) and
+        # removed once the datasets have parsed them.
+        manifest_csv = manifest_dir() / VINDR_WIDE_MANIFEST
+        wide = load_vindr_wide_manifest()
+        split_dir = Path(
+            tempfile.mkdtemp(prefix=f"vindr_wide_{sha256_file(manifest_csv)[:12]}_")
+        )
+        split_datasets = []
+        ids = []
+        sources = []
+        expected = []
+        split_values = []
+        label_any_values = []
+        for split in WIDE_SPLITS:
+            part = wide.loc[wide["split"].astype(str) == split]
+            if part.empty:
+                raise RuntimeError(
+                    f"Frozen {VINDR_WIDE_MANIFEST} has no {split} rows; the wide "
+                    "cohort needs both splits"
+                )
+            split_csv = split_dir / f"{split}.csv"
+            part[["image_id", "label"]].to_csv(split_csv, index=False)
+            root = (
+                cfg.ptx.vindr.root_dir
+                if split == "train"
+                else cfg.ptx.vindr.test_root_dir
+            )
+            split_ds = VinDataset(
+                manifest_csv=str(split_csv), root_dir=str(root), img_size=img_size
+            )
+            split_ids = [str(image_id) for image_id in split_ds.image_ids]
+            if split_ids != part["image_id"].astype(str).tolist():
+                raise RuntimeError(
+                    f"{split}: VinDataset order differs from the frozen wide manifest"
+                )
+            split_datasets.append(split_ds)
+            ids.extend(split_ids)
+            sources.extend([f"vindr_wide_{split}"] * len(split_ids))
+            expected.extend(int(split_ds.labels[image_id]) for image_id in split_ids)
+            split_values.extend([split] * len(split_ids))
+            label_any_values.extend(int(value) for value in part["label_any"])
+        dataset = ConcatDataset(split_datasets)
+        # VinDataset parses its manifest in __init__; the temporary views can go now.
+        shutil.rmtree(split_dir, ignore_errors=True)
+        label_any_labels = np.asarray(label_any_values, dtype=int)
+        extra_columns = [
+            (2, "split", split_values),
+            (4, "label_any", label_any_values),
+        ]
     else:
         raise ValueError(
             "Invalid validation mode: Choose one of "
@@ -239,12 +318,34 @@ def fetch_results_per_resolution(
     np.save(out_dir / f"{prefix}gt.npy", pred_df["label"].to_numpy().astype(int))
     # Section 6.4: ID-keyed predictions (score = fold-mean sigmoid probability)
     pred_df.insert(1, "source", sources)
-    for column, values in extra_columns.items():
-        pred_df[column] = values
+    for position, column, values in extra_columns:
+        if position is None:
+            pred_df[column] = values
+        else:
+            pred_df.insert(position, column, values)
     pred_df.to_csv(
         out_dir / f"{validation_mode}pred_{model_name}_{img_size}_ids.csv",
         index=False,
     )
+    if label_any_labels is not None:
+        # §4.4 E2-wide: the sensitivity row reuses the SAME ensemble predictions; only
+        # the label definition changes (>= 1 reader vote), so the model is not re-run.
+        if len(np.unique(label_any_labels)) < 2:
+            raise RuntimeError(
+                "sensitivity_label_any AUROC is undefined: the E2-wide cohort has one "
+                "class under the any-vote rule"
+            )
+        any_probs = pred_df["prob"].to_numpy().astype(np.float64)
+        ci_low, ci_high = auroc_confidence_interval(label_any_labels, any_probs)
+        ensemble_metrics["sensitivity_label_any"] = {
+            "auc": float(np.round(roc_auc_score(label_any_labels, any_probs), 4)),
+            "auroc_ci": [
+                float(np.round(ci_low, 4)),
+                float(np.round(ci_high, 4)),
+            ],
+            "n_pos": int((label_any_labels == 1).sum()),
+            "n_neg": int((label_any_labels == 0).sum()),
+        }
     return ensemble_metrics
 
 
@@ -254,7 +355,8 @@ def fetch_results_per_resolution(
     type=click.Choice(list(VALIDATION_MODES)),
     required=True,
     help="Choose validation dataset: holdout, ood_reference_like, ood_clean "
-    "(internal holdout and the two E5 runs) or vindr_test, chexlocalize (E2, E4)",
+    "(internal holdout and the two E5 runs) or vindr_test, vindr_wide, chexlocalize "
+    "(E2, E2-wide, E4)",
 )
 @click.option(
     "--e5_manifest",

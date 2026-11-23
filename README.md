@@ -139,8 +139,9 @@ uv run python -m sharpness_matters.ptx.corrected.e5_multidraw --base-seed 0 --dr
 
 **5b. E2 and E4 manifests:** VinDr-CXR v1.0.0 official test (PhysioNet `image_labels_test.csv` + `test/*.dicom`) → `manifests/vindr_test.csv`; CheXlocalize (CheXpert val/test images + label CSVs + `gt_segmentations_*.json`) → `manifests/chexlocalize_cls.csv`, `manifests/chexlocalize_xai.csv`.
 ```bash
-uv run python -m sharpness_matters.ptx.corrected.make_vindr_test
-uv run python -m sharpness_matters.ptx.corrected.make_chexlocalize
+uv run python -m sharpness_matters.ptx.corrected.make_vindr_test          # E2: official test, 5-radiologist consensus (needs test/*.dicom)
+uv run python -m sharpness_matters.ptx.corrected.make_vindr_test --wide   # E2-wide (secondary): all 18,000 images; train part majority >=2/3 readers, sensitivity label >=1/3 (needs train/ + test/)
+uv run python -m sharpness_matters.ptx.corrected.make_chexlocalize        # E4 (needs CheXpert val/test images + label CSVs)
 ```
 
 All manifests are frozen with `.sha256` + `.record.json`; an existing manifest is loaded, never rebuilt, and a hash mismatch stops the run. Commit `manifests/` after this step.
@@ -164,6 +165,7 @@ uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mo
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode ood_clean --e5_manifest manifests/reference_like_clean.csv
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_test     # E2
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode chexlocalize   # E4 classification
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_wide     # E2-wide (+ label_any sensitivity AUROC)
 ```
 
 **9. Saliency evaluation (GT kept on its reference grid; decision-independent K1 cohort):**
