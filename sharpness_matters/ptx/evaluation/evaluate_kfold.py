@@ -15,6 +15,7 @@ Usage:
 
 import os
 import glob
+import tempfile
 import numpy as np
 import torch
 import pytorch_lightning as pl
@@ -25,11 +26,17 @@ import click
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
+from sklearn.metrics import roc_auc_score
 from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
     ChestXrayDataset,
 )
 from sharpness_matters.ptx.datasets.vin_dataset import VinDataset
 from sharpness_matters.ptx.datasets.ptx498_dataset import OODTestDataset
+from sharpness_matters.ptx.datasets.external_eval_datasets import (
+    CheXlocalizeEvalDataset,
+    ManifestVinDataset,
+    load_manifest,
+)
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
 from sharpness_matters.ptx.utils.classification_eval import eval_res
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
@@ -39,6 +46,18 @@ logger = initialize_logger(level="debug")
 DATA_DIR = cfg.ptx.siim_acr.root_dir
 HOME = Path(__file__).resolve().parent.parent
 logger.debug(f"Output Root: {HOME}")
+
+
+def _write_split_csv(frame: pd.DataFrame, key: str) -> str:
+    """Write a per-split `image_id,label` view of a frozen manifest to a temp file.
+
+    The loaders read `image_id,label` only; the frozen manifest stays untouched and is
+    hashed before use, so this is a read-only view, not a new manifest.
+    """
+    directory = tempfile.mkdtemp(prefix=f"stage1_{key}_")
+    path = os.path.join(directory, f"{key}.csv")
+    frame[["image_id", "label"]].to_csv(path, index=False)
+    return path
 
 
 def fetch_results_per_resolution(
@@ -55,6 +74,9 @@ def fetch_results_per_resolution(
     Returns:
         Dict[str, Any]: Dictionary containing evaluation metrics
     """
+    # Extra ID-aligned columns for the added rows (empty for the author's modes).
+    label_any = None
+    extra_columns = {}
     # Extract training files required to initialize dataset
     if validation_mode == "holdout":
         train_dicom_dir = os.path.join(DATA_DIR, "dicom-images-train")
@@ -77,8 +99,73 @@ def fetch_results_per_resolution(
         expected = [int(vin_ds.labels[i]) for i in vin_ds.image_ids] + [1] * len(
             ptx_ds.image_ids
         )
+    elif validation_mode == "vindr_test":
+        # E2 (added row): official VinDr-CXR test split; IDs/labels from the frozen
+        # manifest produced on B. Author VinDataset preprocessing is reused as-is.
+        frame = load_manifest("vindr_test.csv")
+        dataset = ManifestVinDataset(
+            manifest_csv=_write_split_csv(frame, "vindr_test"),
+            root_dir=str(cfg.ptx["vindr"]["test_root_dir"]),
+            img_size=img_size,
+            stats_key="vindr_test",
+        )
+        ids = list(dataset.image_ids)
+        sources = ["vindr_test"] * len(ids)
+        expected = [int(dataset.labels[i]) for i in ids]
+    elif validation_mode == "vindr_wide":
+        # E2-wide (added row): all 18,000 published VinDr images; train and test DICOMs
+        # live in different roots. Main label = majority (>=2/3 readers) on the train
+        # part, consensus on the test part; `label_any` = >=1/3 readers (author's E5
+        # positive rule) is reported as a sensitivity analysis from the SAME scores.
+        frame = load_manifest("vindr_wide.csv")
+        if "label_any" not in frame.columns or "split" not in frame.columns:
+            raise RuntimeError("vindr_wide.csv must hold split and label_any columns")
+        train_frame = frame[frame["split"] == "train"]
+        test_frame = frame[frame["split"] == "test"]
+        vin_ds = ManifestVinDataset(
+            manifest_csv=_write_split_csv(train_frame, "wide_train"),
+            root_dir=str(cfg.ptx["vindr"]["root_dir"]),
+            img_size=img_size,
+            stats_key="vindr_wide_train",
+        )
+        ptx_ds = ManifestVinDataset(
+            manifest_csv=_write_split_csv(test_frame, "wide_test"),
+            root_dir=str(cfg.ptx["vindr"]["test_root_dir"]),
+            img_size=img_size,
+            stats_key="vindr_wide_test",
+        )
+        dataset = ConcatDataset([vin_ds, ptx_ds])
+        ids = list(vin_ds.image_ids) + list(ptx_ds.image_ids)
+        sources = ["vindr_wide_train"] * len(vin_ds.image_ids) + [
+            "vindr_wide_test"
+        ] * len(ptx_ds.image_ids)
+        expected = [int(vin_ds.labels[i]) for i in vin_ds.image_ids] + [
+            int(ptx_ds.labels[i]) for i in ptx_ds.image_ids
+        ]
+        label_by_id = dict(
+            zip(ids, [int(v) for v in frame.set_index("image_id").loc[ids, "label_any"]])
+        )
+        label_any = [label_by_id[image_id] for image_id in ids]
+        extra_columns = {
+            "split": [str(value) for value in frame.set_index("image_id").loc[ids, "split"]],
+            "label_any": label_any,
+        }
+    elif validation_mode == "chexlocalize":
+        # E4 (added row): CheXlocalize frontal cohort, author preprocessing chain.
+        frame = load_manifest("chexlocalize_cls.csv")
+        dataset = CheXlocalizeEvalDataset(
+            manifest_csv=_write_split_csv(frame, "chexlocalize_cls"),
+            img_size=img_size,
+        )
+        ids = list(dataset.image_ids)
+        sources = [f"chexlocalize_{dataset.splits[i]}" for i in ids]
+        expected = [int(dataset.labels[i]) for i in ids]
+        extra_columns = {"split": [str(dataset.splits[i]) for i in ids]}
     else:
-        raise ValueError("Invalid validation mode: Choose one of holdout, ood")
+        raise ValueError(
+            "Invalid validation mode: Choose one of holdout, ood, vindr_test, "
+            "vindr_wide, chexlocalize"
+        )
     # Compute evaluation metrics for given resolution
     all_labels, all_logits_ensemble, ensemble_metrics = eval_res(
         dataset, img_size, model_name, CNNBinaryClassifier, logger
@@ -98,6 +185,17 @@ def fetch_results_per_resolution(
         raise RuntimeError(
             "Prediction order mismatch: dataset-order labels differ from eval labels"
         )
+    if label_any is not None:
+        # E2-wide sensitivity analysis: the SAME fold-averaged scores, second label
+        # rule (>=1/3 readers). No threshold, no re-run, no separate model.
+        label_any_array = np.asarray(label_any).astype(int)
+        if len(np.unique(label_any_array)) < 2:
+            raise RuntimeError("label_any cohort is single-class; AUROC undefined")
+        ensemble_metrics["sensitivity_label_any"] = {
+            "auc": float(roc_auc_score(label_any_array, all_logits_ensemble)),
+            "n_pos": int(label_any_array.sum()),
+            "n_neg": int(len(label_any_array) - label_any_array.sum()),
+        }
     # Save predictions to avoid re-running for stat analysis
     os.makedirs(f"{HOME}/output/classif_preds/", exist_ok=True)
     np.save(
@@ -106,14 +204,14 @@ def fetch_results_per_resolution(
     )
     np.save(f"{HOME}/output/classif_preds/{validation_mode}gt.npy", all_labels)
     # Stage 1: ID-keyed predictions (score = fold-mean sigmoid probability, as in eval_res)
-    pd.DataFrame(
-        {
-            "image_id": ids,
-            "source": sources,
-            "label": np.asarray(all_labels).astype(int),
-            "score": all_logits_ensemble,
-        }
-    ).to_csv(
+    predictions = {
+        "image_id": ids,
+        "source": sources,
+        "label": np.asarray(all_labels).astype(int),
+        "score": all_logits_ensemble,
+    }
+    predictions.update(extra_columns)
+    pd.DataFrame(predictions).to_csv(
         f"{HOME}/output/classif_preds/{validation_mode}pred_{model_name}_{img_size}_ids.csv",
         index=False,
     )
@@ -123,9 +221,15 @@ def fetch_results_per_resolution(
 @click.command()
 @click.option(
     "--validation_mode",
-    type=str,
+    type=click.Choice(
+        ["holdout", "ood", "vindr_test", "vindr_wide", "chexlocalize"],
+        case_sensitive=True,
+    ),
     required=True,
-    help="Choose validation dataset: One of holdout, ood",
+    help=(
+        "Choose validation dataset: holdout, ood (author rows); vindr_test, "
+        "vindr_wide, chexlocalize (added external rows, frozen manifests from B)"
+    ),
 )
 def main(validation_mode: str) -> None:
     """

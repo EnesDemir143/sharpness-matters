@@ -144,6 +144,18 @@ uv run python evaluation/evaluate_kfold.py --validation_mode holdout
 uv run python evaluation/evaluate_kfold.py --validation_mode ood
 ```
 
+**Added external rows (not in the paper):** these read the frozen manifests produced once on `stage2-corrected` (B); run A never regenerates them. Point `ptx.manifests_dir` at that `manifests/` directory (each file's `.sha256` is verified before use).
+```bash
+# copy the frozen manifests from the B checkout if you run A in a separate worktree
+# E2 official VinDr test (3,000 images)
+uv run python evaluation/evaluate_kfold.py --validation_mode vindr_test
+# E2-wide, all 18,000 published VinDr images; the metrics file also carries
+# sensitivity_label_any (>=1 reader rule) computed from the same scores
+uv run python evaluation/evaluate_kfold.py --validation_mode vindr_wide
+# E4 CheXlocalize frontal cohort
+uv run python evaluation/evaluate_kfold.py --validation_mode chexlocalize
+```
+
 **Saliency map evaluation:**
 ```bash
 # Internal test set
@@ -151,6 +163,10 @@ uv run python evaluation/evaluate_saliency.py
 
 # External test set
 uv run python evaluation/evaluate_saliency_ood.py
+
+# E4 CheXlocalize XAI cohort (author saliency rule: fold mean -> threshold,
+# decision-conditional scoring, 0.25/0.5/0.75)
+uv run python evaluation/evaluate_saliency_chexlocalize.py
 ```
 
 ### Statistical Analysis

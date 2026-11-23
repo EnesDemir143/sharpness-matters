@@ -2,7 +2,13 @@ ptx:
   siim_acr:
     root_dir: "/Users/enesdemir/Documents/ap_articles/data/siim-acr"
   vindr:
-      root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/train"  # VinDr train DICOMs (E5); images not downloaded yet
+      root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/train"  # VinDr train DICOMs (E5 / E2-wide train part)
+      test_root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/test"  # E2 official test DICOMs
+      test_labels_csv: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/annotations/image_labels_test.csv"
+  chexlocalize:  # E4 (added row; not in the paper)
+      annotations_dir: "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXlocalize"
+      chexpert_dir: "/Users/enesdemir/Documents/ap_articles/data/chexlocalize/CheXpert"
+  manifests_dir: "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/manifests"  # Frozen manifests produced once on stage2-corrected (B); run A only reads them
   ptx498:
       root_dir: "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix"
   model:
