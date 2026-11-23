@@ -45,3 +45,14 @@ def test_xai_masks_load_with_author_preprocessing():
         assert 0.0 <= float(item["data"].min()) and float(item["data"].max()) <= 1.0
         assert item["mask"].shape == (64, 64) and float(item["mask"].max()) > 0
         assert int(item["label"]) == 1
+
+
+def test_saliency_script_wires_the_xai_manifest():
+    """The E4 saliency entry point builds its dataset from the frozen XAI manifest."""
+    from sharpness_matters.ptx.evaluation import evaluate_saliency_chexlocalize as script
+
+    frame = load_manifest("chexlocalize_xai.csv")
+    view = script._write_xai_view(frame)
+    dataset = CheXlocalizeEvalDataset(view, img_size=64, with_mask=True)
+    assert len(dataset) == 16 and int(frame["label"].sum()) == 16
+    assert script.collate_fn([dataset[0], dataset[1]])["data"].shape == (2, 1, 64, 64)

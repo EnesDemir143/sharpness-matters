@@ -16,6 +16,7 @@ Usage:
 import os
 import glob
 import tempfile
+import shutil
 import numpy as np
 import torch
 import pytorch_lightning as pl
@@ -58,6 +59,19 @@ def _write_split_csv(frame: pd.DataFrame, key: str) -> str:
     path = os.path.join(directory, f"{key}.csv")
     frame[["image_id", "label"]].to_csv(path, index=False)
     return path
+
+
+def _temp_manifest_dataset(frame: pd.DataFrame, key: str, factory) -> Dataset:
+    """Build a dataset from a temporary `image_id,label` view, then remove the view.
+
+    Loaders read their manifest only in `__init__`, so the temporary file is not
+    needed afterwards; the frozen manifest itself stays untouched.
+    """
+    path = _write_split_csv(frame, key)
+    try:
+        return factory(path)
+    finally:
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
 
 def fetch_results_per_resolution(
@@ -103,11 +117,15 @@ def fetch_results_per_resolution(
         # E2 (added row): official VinDr-CXR test split; IDs/labels from the frozen
         # manifest produced on B. Author VinDataset preprocessing is reused as-is.
         frame = load_manifest("vindr_test.csv")
-        dataset = ManifestVinDataset(
-            manifest_csv=_write_split_csv(frame, "vindr_test"),
-            root_dir=str(cfg.ptx["vindr"]["test_root_dir"]),
-            img_size=img_size,
-            stats_key="vindr_test",
+        dataset = _temp_manifest_dataset(
+            frame,
+            "vindr_test",
+            lambda path: ManifestVinDataset(
+                manifest_csv=path,
+                root_dir=str(cfg.ptx["vindr"]["test_root_dir"]),
+                img_size=img_size,
+                stats_key="vindr_test",
+            ),
         )
         ids = list(dataset.image_ids)
         sources = ["vindr_test"] * len(ids)
@@ -122,17 +140,25 @@ def fetch_results_per_resolution(
             raise RuntimeError("vindr_wide.csv must hold split and label_any columns")
         train_frame = frame[frame["split"] == "train"]
         test_frame = frame[frame["split"] == "test"]
-        vin_ds = ManifestVinDataset(
-            manifest_csv=_write_split_csv(train_frame, "wide_train"),
-            root_dir=str(cfg.ptx["vindr"]["root_dir"]),
-            img_size=img_size,
-            stats_key="vindr_wide_train",
+        vin_ds = _temp_manifest_dataset(
+            train_frame,
+            "wide_train",
+            lambda path: ManifestVinDataset(
+                manifest_csv=path,
+                root_dir=str(cfg.ptx["vindr"]["root_dir"]),
+                img_size=img_size,
+                stats_key="vindr_wide_train",
+            ),
         )
-        ptx_ds = ManifestVinDataset(
-            manifest_csv=_write_split_csv(test_frame, "wide_test"),
-            root_dir=str(cfg.ptx["vindr"]["test_root_dir"]),
-            img_size=img_size,
-            stats_key="vindr_wide_test",
+        ptx_ds = _temp_manifest_dataset(
+            test_frame,
+            "wide_test",
+            lambda path: ManifestVinDataset(
+                manifest_csv=path,
+                root_dir=str(cfg.ptx["vindr"]["test_root_dir"]),
+                img_size=img_size,
+                stats_key="vindr_wide_test",
+            ),
         )
         dataset = ConcatDataset([vin_ds, ptx_ds])
         ids = list(vin_ds.image_ids) + list(ptx_ds.image_ids)
@@ -153,9 +179,10 @@ def fetch_results_per_resolution(
     elif validation_mode == "chexlocalize":
         # E4 (added row): CheXlocalize frontal cohort, author preprocessing chain.
         frame = load_manifest("chexlocalize_cls.csv")
-        dataset = CheXlocalizeEvalDataset(
-            manifest_csv=_write_split_csv(frame, "chexlocalize_cls"),
-            img_size=img_size,
+        dataset = _temp_manifest_dataset(
+            frame,
+            "chexlocalize_cls",
+            lambda path: CheXlocalizeEvalDataset(manifest_csv=path, img_size=img_size),
         )
         ids = list(dataset.image_ids)
         sources = [f"chexlocalize_{dataset.splits[i]}" for i in ids]

@@ -17,6 +17,7 @@ preprocessing.
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -202,6 +203,9 @@ class ManifestVinDataset(VinDataset):
             ]
         )
         stats_path = f"{HOME}/output/cache/vin_stats_{stats_key}.pkl"
+        # The author's loader assumes the cache directory already exists (it is created
+        # by the label cache on the SIIM path); a fresh checkout has no output/cache.
+        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
         self.mean, self.std = self.get_global_mean_std(stats_path)
         logger.info(f"Len of {stats_key} Vin dataset: {len(self.image_ids)}")
 

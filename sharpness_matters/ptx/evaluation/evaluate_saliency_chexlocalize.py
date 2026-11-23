@@ -75,7 +75,7 @@ def run_experiment(
     pred_loader = DataLoader(
         dataset, batch_size=4, shuffle=False, num_workers=8, pin_memory=True
     )
-    cache_dir = f"{HOME}/output/chunk_predictions_{model_name}_{img_size}"
+    cache_dir = f"{HOME}/output/chunk_predictions_{model_name}_{img_size}_chexlocalize"
     os.makedirs(cache_dir, exist_ok=True)
     for fold in range(5):
         ckpt_dir = f"{CHECKPOINT_DIR}/{model_name}/{model_name}_{img_size}_logs/lightning_logs/version_{fold}/checkpoints/"

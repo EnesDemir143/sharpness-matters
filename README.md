@@ -146,7 +146,8 @@ uv run python evaluation/evaluate_kfold.py --validation_mode ood
 
 **Added external rows (not in the paper):** these read the frozen manifests produced once on `stage2-corrected` (B); run A never regenerates them. Point `ptx.manifests_dir` at that `manifests/` directory (each file's `.sha256` is verified before use).
 ```bash
-# copy the frozen manifests from the B checkout if you run A in a separate worktree
+# `ptx.manifests_dir` must point at B's frozen manifests/ (already set in this config);
+# each file's `.sha256` is verified before use.
 # E2 official VinDr test (3,000 images)
 uv run python evaluation/evaluate_kfold.py --validation_mode vindr_test
 # E2-wide, all 18,000 published VinDr images; the metrics file also carries
