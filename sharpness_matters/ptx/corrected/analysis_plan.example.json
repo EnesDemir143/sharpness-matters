@@ -1,0 +1,98 @@
+{
+  "plan_version": 1,
+  "description": "Stage-2 (B) pre-registered statistics plan. TEMPLATE: every input path is a placeholder and must be replaced before lock_plan(); relative paths resolve against this file's directory. A family must be endpoint-homogeneous; classification AUROC comparisons use the classification endpoint and are never mixed with the XAI endpoints (localization, sanity, faithfulness).",
+  "families": [
+    {
+      "name": "siim_k1_localization_iou_t050",
+      "correction": "bh",
+      "alpha": 0.05,
+      "endpoint_class": "localization",
+      "description": "K1: every GT-positive SIIM holdout image, decision independent. Paired IoU at threshold 0.50 (main fold rule).",
+      "comparisons": [
+        {
+          "id": "k1_iou_t050_resnet512_vs_densenet512",
+          "kind": "saliency_paired",
+          "endpoint_class": "localization",
+          "description": "PLACEHOLDER paths: replace with the two ID-keyed per-image saliency CSVs of this branch.",
+          "inputs": {
+            "a": "outputs/saliency/saliency_siim_holdout_resnet_512_main.csv",
+            "b": "outputs/saliency/saliency_siim_holdout_densenet_512_main.csv",
+            "metric_column": "iou",
+            "threshold": {
+              "column": "threshold",
+              "value": 0.5
+            }
+          },
+          "cohort": {
+            "description": "K1: the score CSV is keyed by exactly the GT-positive ImageId set, so no extra row filter is applied.",
+            "where": {}
+          },
+          "paired_difference": "b - a",
+          "zero_method": "wilcox",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        },
+        {
+          "id": "k1_iou_t050_resnet512_vs_resnet768",
+          "kind": "saliency_paired",
+          "endpoint_class": "localization",
+          "description": "PLACEHOLDER paths: replace before locking.",
+          "inputs": {
+            "a": "outputs/saliency/saliency_siim_holdout_resnet_512_main.csv",
+            "b": "outputs/saliency/saliency_siim_holdout_resnet_768_main.csv",
+            "metric_column": "iou",
+            "threshold": {
+              "column": "threshold",
+              "value": 0.5
+            }
+          },
+          "cohort": {
+            "description": "K1: all GT-positive SIIM holdout images.",
+            "where": {}
+          },
+          "paired_difference": "b - a",
+          "zero_method": "wilcox",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        }
+      ]
+    },
+    {
+      "name": "siim_classification_auroc",
+      "correction": "bh",
+      "alpha": 0.05,
+      "endpoint_class": "classification",
+      "description": "Classification performance: does the paired AUROC differ between the two models at the same resolution? Never merged with localization, sanity or faithfulness.",
+      "comparisons": [
+        {
+          "id": "auroc_siim_holdout_resnet512_vs_densenet512",
+          "kind": "classification_auroc",
+          "endpoint_class": "classification",
+          "description": "PLACEHOLDER paths: replace with the two ID-keyed `*_ids.csv` classification outputs.",
+          "inputs": {
+            "a": "outputs/classification/siim_holdout_resnet_512_ids.csv",
+            "b": "outputs/classification/siim_holdout_densenet_512_ids.csv",
+            "prob_column": "prob",
+            "label_column": "label"
+          },
+          "cohort": {
+            "description": "Whole SIIM holdout cohort: both classes are required for AUROC.",
+            "where": {}
+          },
+          "paired_difference": "b - a",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        }
+      ]
+    }
+  ]
+}

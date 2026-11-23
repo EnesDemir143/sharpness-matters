@@ -5,11 +5,9 @@ This script analyzes the demographic distribution (age and sex) of medical imagi
 using the VinDataset or ChestXrayDataset (SIIM-ACR) classes. It generates comprehensive statistics and visualizations.
 
 Usage:
-    # Analyze VinDR dataset (default)
-    python sharpness_matters/ptx/datasets/extract_demographics.py
-    
-    # Analyze VinDR dataset explicitly
-    python sharpness_matters/ptx/datasets/extract_demographics.py --dataset vindr
+    # Analyze VinDR dataset (an ID+label manifest is required in stage 2)
+    python sharpness_matters/ptx/datasets/extract_demographics.py \
+        --dataset vindr --vindr-manifest manifests/reference_like_combined.csv
     
     # Analyze SIIM-ACR dataset (test split by default)
     python sharpness_matters/ptx/datasets/extract_demographics.py --dataset siim_acr
@@ -45,6 +43,25 @@ SIIM_ROOT_DIR = cfg.ptx.siim_acr.root_dir
 VINDR_ROOT_DIR = cfg.ptx.vindr.root_dir
 
 
+def dedupe_demographics_by_image_id(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, int]:
+    """Collapse duplicate ``image_id`` rows; returns (frame, removed row count).
+
+    # B (Section 10.2): the author's VinDr derivation counts an ID that is in both
+    #   the negative and the positive list twice (PTX-03), and the E5 reference-like
+    #   manifest reproduces that on purpose. Demographic denominators are reported
+    #   over unique images, so duplicates are removed here (first row kept) and the
+    #   removed count is returned for the record.
+    #   check: tests/corrected/test_data.py::test_demographics_dedupe_by_image_id
+    """
+    if "image_id" not in df.columns:
+        return df, 0
+    before = len(df)
+    deduped = df.drop_duplicates(subset="image_id", keep="first").reset_index(drop=True)
+    return deduped, before - len(deduped)
+
+
 def analyze_demographics(
     dataset: Any, dataset_name: str = "Unknown", output_dir: str = f"{HOME}/output"
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
@@ -67,6 +84,18 @@ def analyze_demographics(
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(demographics)
 
+    # B (Section 10.2): demographics are reported over unique image IDs. The E5
+    #   reference-like manifest keeps an ID that the author's lists counted twice
+    #   (duplicate rows, Section 4.2), so the same image would otherwise enter the
+    #   age/sex denominators twice.
+    #   check: tests/corrected/test_data.py::test_demographics_dedupe_by_image_id
+    df, duplicate_rows_removed = dedupe_demographics_by_image_id(df)
+    if duplicate_rows_removed:
+        logger.info(
+            f"Removed {duplicate_rows_removed} duplicate image_id row(s); "
+            "demographics are reported over unique image IDs"
+        )
+
     # Ensure age column is properly typed
     df["age"] = pd.to_numeric(df["age"], errors="coerce")
 
@@ -78,6 +107,7 @@ def analyze_demographics(
     stats = {
         "dataset_name": dataset_name,
         "total_samples": len(df),
+        "duplicate_rows_removed": int(duplicate_rows_removed),
         "samples_with_age": int(df["age"].notna().sum()),
         "samples_with_sex": int(df["sex"].notna().sum()),
         "samples_with_both": int(df[["age", "sex"]].notna().all(axis=1).sum()),
@@ -581,6 +611,15 @@ def main() -> None:
         help="Data split to analyze: train, test, or both (only for SIIM-ACR)",
     )
     parser.add_argument(
+        "--vindr-manifest",
+        default=None,
+        help=(
+            "ID+label manifest of the VinDr cohort (required for --dataset vindr); "
+            "e.g. manifests/reference_like_combined.csv (E5) or "
+            "manifests/reference_like_clean.csv (E5-clean)"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default=f"{HOME}/output/demographics",
         help="Output directory for results",
@@ -588,12 +627,19 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.dataset == "vindr" and not args.vindr_manifest:
+        parser.error(
+            "--vindr-manifest is required for --dataset vindr: stage 2 VinDataset "
+            "reads an ID+label manifest, not the author's .txt lists"
+        )
+
     logger.info(f"Starting {args.dataset} dataset demographic analysis...")
 
     try:
         # Initialize dataset based on choice
         if args.dataset == "vindr":
-            dataset = VinDataset(img_size=224)
+            # B (PTX-03/PTX-08, Section 4.2): the cohort comes from a frozen manifest
+            dataset = VinDataset(manifest_csv=args.vindr_manifest, img_size=224)
             dataset_name = "VinDR"
         elif args.dataset == "siim_acr":
             if args.split == "both":

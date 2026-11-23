@@ -2,21 +2,37 @@
 Utility file for evaluation of classification performance
 """
 
-import os
 import hashlib
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 from scipy.stats import norm
 import scipy.stats as st
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
 from tqdm import tqdm
-from pathlib import Path
-from typing import Dict, List, Tuple, Union, Type
-from sharpness_matters.config.load_config import cfg
+from typing import Dict, List, Optional, Tuple, Union, Type
+from sharpness_matters.ptx.corrected.cv_record import fold_checkpoints, load_cv_record
 
-HOME = Path(__file__).resolve().parent.parent
-CHECKPOINT_DIR = cfg.ptx.model.checkpoint_dir
+# B (PTX-18 / PTX-07, Section 6.1): current -> the fold checkpoint was discovered with
+#   `os.listdir(...)[0]` and a fold without a checkpoint was skipped (`continue`); a
+#   run with 4/5 checkpoints silently passed as a 5-fold ensemble. Problem -> no fold
+#   identity and no integrity check. New -> checkpoints and their SHA-256 come from the
+#   run's `cv_record.json` (`load_cv_record`); a missing fold, a missing file or a hash
+#   mismatch raises instead of shrinking the ensemble. Path + sha256 are still logged.
+#   check: tests/corrected/test_classif_eval.py::test_missing_fold_checkpoint_raises,
+#   ::test_sha256_mismatch_raises
+# B (PTX-09 / Section 6.2): decision A -> fold outputs are averaged as sigmoid
+#   probabilities exactly as the author, no logit averaging.
+#   check: ::test_ensemble_is_mean_of_fold_probabilities
+# B (Section 6.3): current -> fold and ensemble decisions used a fixed 0.5; new -> the
+#   baseline's own OOF threshold `record["tau"]`, decision `p >= tau`, reported in the
+#   metrics dict. check: ::test_threshold_uses_tau
+# B (PTX-08 / Section 6.4): current -> `eval_res` returned bare arrays and the caller
+#   wrote anonymous `.npy` files; new -> an ID-keyed DataFrame
+#   (`image_id,label,prob,prob_fold0..k`) in dataset order, verified against the
+#   dataset-order labels. check: ::test_output_id_order_matches_input,
+#   ::test_label_misalignment_raises
 
 
 def _sha256(path: str) -> str:
@@ -132,57 +148,105 @@ def evaluate_fold(fold_number: int, val_loader: DataLoader, model: torch.nn.Modu
     return {"logits": all_logits, "labels": np.array(all_labels)}
 
 
+def _dataset_order_labels(dataset: Dataset, ids: List[str]) -> Optional[np.ndarray]:
+    """Dataset-order labels when the dataset exposes an `image_id -> label` dict.
+
+    Used as a fallback when the caller does not pass `labels`; `ConcatDataset` is
+    walked slice by slice so the ID order of the concatenation is preserved.
+    """
+    labels = getattr(dataset, "labels", None)
+    if isinstance(labels, dict):
+        if any(image_id not in labels for image_id in ids):
+            return None
+        return np.asarray([int(labels[image_id]) for image_id in ids])
+    subsets = getattr(dataset, "datasets", None)
+    if subsets is not None:
+        parts = []
+        start = 0
+        for subset in subsets:
+            stop = start + len(subset)
+            part = _dataset_order_labels(subset, ids[start:stop])
+            if part is None:
+                return None
+            parts.append(part)
+            start = stop
+        return np.concatenate(parts) if parts else None
+    return None
+
+
 def eval_res(
     dataset: Dataset,
     img_size: int,
     model_name: str,
     model_class: Type[torch.nn.Module],
     logger,
+    ids: List[str],
+    labels: Optional[np.ndarray] = None,
 ):
     """
-    Evaluate a 5-fold cross-validated classification model and aggregate ensemble metrics.
-    Loads each fold's best checkpoint, collects logits and labels, computes per-fold
-    (acc, auc, f1) and ensemble metrics by averaging logits across folds.
+    Evaluate a cross-validated classification model and aggregate ensemble metrics.
+    Loads each fold's best checkpoint from the run's cv record, collects sigmoid
+    probabilities and labels, computes per-fold (acc, auc, f1) and ensemble metrics by
+    averaging sigmoid probabilities across folds, and returns ID-keyed predictions.
     Parameters
-    ---------
+    ----------
     dataset : torch.utils.data.Dataset
         Validation dataset (same for all folds).
     img_size : int
-        Image size suffix used in checkpoint path construction.
+        Image size suffix of the run whose cv record is read.
     model_name : str
         Base model name used in directory structure.
     model_class : Type[torch.nn.Module]
         LightningModule class with `load_from_checkpoint`.
     logger : logging.Logger
         Logger for debug output.
+    ids : List[str]
+        Image IDs in dataset order; defines the order of the returned frame.
+    labels : Optional[np.ndarray]
+        Expected labels in dataset order. When omitted, they are taken from the
+        dataset's `labels` dict if it has one.
     Returns
     -------
-    all_labels : np.ndarray
-        Ground-truth labels (shared across folds).
-    all_logits_ensemble : np.ndarray
-        Averaged logits across the 5 folds (ensemble output).
+    pred_df : pd.DataFrame
+        Columns `image_id,label,prob,prob_fold0..prob_foldk-1` in dataset order;
+        `prob` is the mean of the fold sigmoid probabilities.
     ensemble_metrics : dict
-        Dict with keys: 'acc', 'auc', 'f1', 'auroc_ci'.
+        Dict with keys: 'acc', 'auc', 'f1', 'auroc_ci', 'tau'.
     """
-    k_folds = 5
-    results = []
+    ids = [str(image_id) for image_id in ids]
+    if len(ids) != len(dataset):
+        raise RuntimeError(
+            f"ID/dataset length mismatch: {len(ids)} ids vs {len(dataset)} samples"
+        )
+    # Checkpoints and the operating threshold come from the run's cv record, which
+    # verifies every fold is present and every recorded sha256 matches (Section 6.1).
+    record = load_cv_record(model_name, img_size)
+    checkpoints = fold_checkpoints(record)
+    k_folds = len(checkpoints)
+    if int(record["k_folds"]) != k_folds:
+        raise RuntimeError(
+            f"cv record covers {k_folds} folds but declares k_folds={record['k_folds']}"
+        )
+    # Section 6.3: the baseline's own OOF threshold, not a fixed 0.5.
+    tau = float(record["tau"])
+    expected_labels = (
+        np.asarray(labels).astype(int).reshape(-1)
+        if labels is not None
+        else _dataset_order_labels(dataset, ids)
+    )
+    if expected_labels is not None and len(expected_labels) != len(ids):
+        raise RuntimeError(
+            f"label/id length mismatch: {len(expected_labels)} labels vs {len(ids)} ids"
+        )
+
     val_loader = DataLoader(dataset, batch_size=32, num_workers=8, shuffle=False)
-    # Iterate through folds
-    all_logits_ensemble = []
-    all_labels = None
+    fold_probs = []
+    fold_labels = []
     metrics = {"acc": [], "auc": [], "f1": []}
     print(f"Evaluating {model_name} model with image size {img_size}...")
     # Compute fold-wise metrics
-    for fold in range(k_folds):
+    for fold, checkpoint_path in enumerate(checkpoints):
         print(f"\nEvaluating Fold {fold + 1}/{k_folds}...")
-        # Path to the best model checkpoint for this fold
-        name = os.listdir(
-            f"{CHECKPOINT_DIR}/{model_name}/{model_name}_{img_size}_logs/lightning_logs/version_{fold}/checkpoints/"
-        )[0]
-        checkpoint_path = f"{CHECKPOINT_DIR}/{model_name}/{model_name}_{img_size}_logs/lightning_logs/version_{fold}/checkpoints/{name}"
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint not found for fold {fold}: {checkpoint_path}")
-            continue
         # Evaluate this fold
         model = model_class.load_from_checkpoint(checkpoint_path)
         logger.info(
@@ -191,40 +255,72 @@ def eval_res(
         model.eval()
         model.to("cuda" if torch.cuda.is_available() else "cpu")
         fold_results = evaluate_fold(fold, val_loader, model)
-        all_logits_ensemble.append(fold_results["logits"])
-        fold_preds = (fold_results["logits"] > 0.5).astype(int)
-        acc = accuracy_score(fold_results["labels"], fold_preds)
-        auc = roc_auc_score(fold_results["labels"], fold_results["logits"])
-        f1 = f1_score(fold_results["labels"], fold_preds)
-        # Store labels once (labels are the same for all folds)
-        if all_labels is None:
-            all_labels = fold_results["labels"]
+        probs = np.asarray(fold_results["logits"], dtype=np.float64).reshape(-1)
+        fold_label = np.asarray(fold_results["labels"]).astype(int).reshape(-1)
+        if len(probs) != len(ids):
+            raise RuntimeError(
+                f"fold {fold}: {len(probs)} predictions for {len(ids)} dataset ids"
+            )
+        # Labels are the same for every fold; a change means the loader reordered the
+        # dataset between folds, so the IDs no longer describe the predictions.
+        if fold_labels and not np.array_equal(fold_labels[0], fold_label):
+            raise RuntimeError(
+                f"fold {fold}: label order changed between folds; predictions are not "
+                "ID-aligned"
+            )
+        if expected_labels is not None and not np.array_equal(
+            expected_labels, fold_label
+        ):
+            raise RuntimeError(
+                f"fold {fold}: label misalignment, dataset-order labels differ from "
+                "the evaluated labels"
+            )
+        fold_probs.append(probs)
+        fold_labels.append(fold_label)
+        fold_preds = (probs >= tau).astype(int)
+        acc = accuracy_score(fold_label, fold_preds)
+        auc = roc_auc_score(fold_label, probs)
+        f1 = f1_score(fold_label, fold_preds)
         metrics["acc"].append(acc)
         metrics["auc"].append(auc)
         metrics["f1"].append(f1)
+        logger.debug(
+            f"Fold {fold} confusion matrix at tau={tau}: "
+            f"{confusion_matrix(fold_label, fold_preds).tolist()}"
+        )
     # Compute average metrics from all folds
     for key in metrics:
         metrics[key] = np.round(np.mean(metrics[key]), 4)
-    # Combine logits from all folds (average for ensemble)
-    all_logits_ensemble = np.mean(all_logits_ensemble, axis=0)
-    # Compute ensemble metrics
-    all_preds = (all_logits_ensemble > 0.5).astype(int)
+    # Section 6.2 (decision A): the ensemble is the mean of the fold sigmoid
+    # probabilities, exactly as the author; logits are never averaged.
+    all_probs_ensemble = np.mean(fold_probs, axis=0)
+    all_labels = fold_labels[0]
+    # Compute ensemble metrics at the baseline's own threshold
+    all_preds = (all_probs_ensemble >= tau).astype(int)
     accuracy = accuracy_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_logits_ensemble)
+    auc = roc_auc_score(all_labels, all_probs_ensemble)
     f1 = f1_score(all_labels, all_preds)
     cm = confusion_matrix(all_labels, all_preds)
-    ci = auroc_confidence_interval(all_labels, all_logits_ensemble)
+    ci = auroc_confidence_interval(all_labels, all_probs_ensemble)
     # Save metrics as dict for ease of reporting csv
     ensemble_metrics = {}
     ensemble_metrics["acc"] = np.round(accuracy, 4)
     ensemble_metrics["auc"] = np.round(auc, 4)
     ensemble_metrics["f1"] = np.round(f1, 4)
     ensemble_metrics["auroc_ci"] = np.round(ci, 4)
+    ensemble_metrics["tau"] = np.round(tau, 6)
     # Log metrics
     logger.debug("\nEnsemble Evaluation Results:")
+    logger.debug(f"Threshold tau: {tau}")
     logger.debug(f"Accuracy: {accuracy:.4f}")
     logger.debug(f"AUC: {auc:.4f}")
     logger.debug(f"AUROC CI: {ci}")
     logger.debug(f"F1: {f1:.4f}")
     logger.debug(f"Confusion Matrix: {cm}")
-    return all_labels, all_logits_ensemble, ensemble_metrics
+    # Section 6.4: predictions are keyed by ImageId, in dataset order.
+    pred_df = pd.DataFrame(
+        {"image_id": ids, "label": all_labels, "prob": all_probs_ensemble}
+    )
+    for fold, probs in enumerate(fold_probs):
+        pred_df[f"prob_fold{fold}"] = probs
+    return pred_df, ensemble_metrics

@@ -15,6 +15,7 @@ import nibabel as nib
 from typing import Dict, Any, Tuple, Union, List, Optional
 
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
+from sharpness_matters.ptx.corrected.preprocess import eval_transform, minmax_per_image
 from sharpness_matters.config.load_config import cfg
 
 HOME = Path(__file__).resolve().parent.parent
@@ -30,106 +31,47 @@ class OODTestDataset(Dataset):
         self,
         root_dir: str = cfg.ptx.ptx498.root_dir,
         img_size: int = 224,
-        stats_path: str = f"{HOME}/output/cache/stats_ptx498.pkl",
+        transform: Optional[Any] = None,
     ):
         """
         Initialize PTX498 dataset.
 
+        # B (PTX-27 / Section 5.4): no dataset mean/std and no stats pickle; the
+        #   image is scaled per image with min-max. # B (PTX-26 / Section 5.3): the
+        #   default preprocessing is the shared eval_transform policy. # B (PTX-02 /
+        #   Section 7.1): the mask stays on the native NIfTI grid (no resize, no
+        #   *255, uint8 {0,1}) and is rotated exactly like the image.
+        #   check: tests/corrected/test_data.py::test_ptx498_mask_*
+
         Args:
             root_dir (str): Root directory containing Site folders with NIfTI files
             img_size (int): Target image size for resizing
-            stats_path (str): Path to save/load dataset statistics
+            transform (Optional[Any]): Explicit preprocessing; defaults to eval_transform
         """
         self.root_dir = root_dir
         self.img_size = img_size
         self.parse_images()
-        self.transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize((img_size, img_size), antialias=True),
-            ]
+        self.transform = (
+            transform if transform is not None else eval_transform(img_size)
         )
-        self.resize = transforms.Resize((img_size, img_size), antialias=True)
-        self.mean, self.std = self.get_global_mean_std(stats_path)
-
-    def get_global_mean_std(self, stats_path: str) -> Tuple[float, float]:
-        """
-        Compute or load global mean and standard deviation for the dataset.
-
-        Args:
-            stats_path (str): Path to save/load statistics file
-
-        Returns:
-            Tuple[float, float]: Global mean and standard deviation
-        """
-        if os.path.exists(stats_path):
-            with open(stats_path, "rb") as f:
-                data = pickle.load(f)
-                return data["mean"], data["std"]
-        mean, std = 0, 0
-        for id in tqdm(self.image_ids, desc="Computing stats for the dataset"):
-            site = id.split("_")[0]
-            number = id.split("_")[1]
-            image_path = os.path.join(
-                self.root_dir, f"Site{site}", f"{number}.4.img.nii.gz"
-            )
-            mask_path = os.path.join(
-                self.root_dir, f"Site{site}", f"{number}.5.mask.nii.gz"
-            )
-            mask = nib.load(mask_path).get_fdata()
-            image = nib.load(image_path).get_fdata()
-            mean_ = image.mean()
-            std_ = image.std()
-            mean += mean_
-            std += std_
-        mean = mean / len(self.image_ids)
-        std = std / len(self.image_ids)
-        stats_dict = {"mean": mean, "std": std}
-        # Save the dictionary to a file
-        with open(stats_path, "wb") as f:
-            pickle.dump(stats_dict, f)
-        return mean, std
-
-    def z_normalize(self, xray_array: np.ndarray) -> np.ndarray:
-        """
-        Perform Z-normalization on an input X-ray NumPy array.
-
-        Args:
-            xray_array (np.ndarray): Input X-ray image array
-
-        Returns:
-            np.ndarray: Z-normalized and min-max scaled X-ray image array
-        """
-        # Compute mean and standard deviation of the array
-        # mean = np.mean(xray_array)
-        # std = np.std(xray_array)
-
-        # Avoid division by zero
-        if self.std == 0:
-            logger.warning(
-                "Standard deviation of the input array is zero. Cannot perform Z-normalization."
-            )
-            return xray_array
-
-        # Apply Z-normalization
-        normalized_array = (xray_array - self.mean) / self.std
-        # Min-Max scaling to [0, 1]
-        min_val = np.min(normalized_array)
-        max_val = np.max(normalized_array)
-        scaled_array = (normalized_array - min_val) / (max_val - min_val)
-        return scaled_array
 
     def parse_images(self) -> None:
         """
         Parse and collect image IDs from all sites in the dataset.
         Populates self.image_ids with format 'Site_ID'.
+
+        # B (PTX-18 / Section 7.3, follow-up): `ids` was a `set`, so iteration order
+        #   (and therefore dataset order) depended on PYTHONHASHSEED; saliency chunk
+        #   files are written and scored in later runs. New: site order A, B, C fixed
+        #   and IDs sorted within each site, so the order depends only on file names.
+        #   check: tests/corrected/test_data.py::test_ptx498_image_id_order_is_deterministic
         """
         sites = ["A", "B", "C"]
         self.image_ids = []
         for site in sites:
-            all_paths = os.listdir(os.path.join(self.root_dir, f"Site{site}"))
-            ids = [i.split(".")[0] for i in all_paths]
-            ids = set(ids)
+            site_dir = os.path.join(self.root_dir, f"Site{site}")
+            all_paths = os.listdir(site_dir)
+            ids = sorted({path.split(".")[0] for path in all_paths})
             for id in ids:
                 self.image_ids.append(f"{site}_{id}")
 
@@ -158,11 +100,15 @@ class OODTestDataset(Dataset):
                 f"Image and mask must have the same height and width. Image shape: {image.shape}, Mask shape: {mask.shape}"
             )
         image = np.array(image * 255).astype(np.uint8)
-        # Convert binary mask to RGB if necessary
+        # Convert binary mask to RGB if necessary. Masks are uint8 {0,1} (PTX-02 /
+        # Section 7.1), so the foreground is scaled to 255 for display; a 0/255 mask
+        # (e.g. the thresholded CAM) is unchanged.
         if len(mask.shape) == 2:  # Single-channel binary or multi-class mask
+            mask = np.asarray(mask)
+            foreground = np.where(mask > 0, 255, 0).astype(np.uint8)
             colored_mask = np.zeros_like(image, dtype=np.uint8)
             for c in range(3):
-                colored_mask[..., c] = mask * mask_color[c]  # Apply mask color
+                colored_mask[..., c] = foreground * mask_color[c]  # Apply mask color
         else:
             colored_mask = mask  # Assume already RGB for multi-class
 
@@ -185,9 +131,9 @@ class OODTestDataset(Dataset):
         Returns:
             Dict[str, Union[torch.Tensor, np.ndarray, int, str]]: Dictionary containing:
                 - data: Processed image tensor
-                - mask: Segmentation mask array
+                - mask: Binary mask array on the native NIfTI grid, uint8 {0,1}
                 - label: Binary label (always 1 for pneumothorax)
-                - pid: Patient ID string
+                - pid / image_id: image ID string
         """
         # Extract image and mask paths
         image_id = self.image_ids[idx]
@@ -199,23 +145,35 @@ class OODTestDataset(Dataset):
         mask_path = os.path.join(
             self.root_dir, f"Site{site}", f"{number}.5.mask.nii.gz"
         )
-        # Load from paths
+        # Load from paths. # B (PTX-02 / Section 7.1): the mask keeps its native
+        # grid (no resize) and is binarised with `> 0` (Section 9.2 value range is an
+        # open data check, so no `* 255` and no assumed {0,1}/{0,255} convention).
         mask = nib.load(mask_path).get_fdata()
-        if len(mask.shape) < 3:
-            mask = np.expand_dims(mask, -1)
-        mask = self.resize(torch.tensor(mask).permute(2, 0, 1))
+        mask = np.squeeze(mask)
+        if mask.ndim != 2:
+            raise RuntimeError(
+                f"PTX-498 mask {mask_path} is not a 2D grid after squeeze: "
+                f"shape {mask.shape}"
+            )
+        mask = (mask > 0).astype(np.uint8)
         image = nib.load(image_path).get_fdata().astype(np.float32)
         image = np.expand_dims(image, -1)
-        image = self.z_normalize(image)
-        image = self.transform(image)  # This is only a resize, mask was resized earlier
-        # For some reason, the images and masks were rotated by 90 degrees in the original dataset
+        image = minmax_per_image(image)
+        image = self.transform(image)  # eval_transform: ToTensor -> Resize
+        # For some reason, the images and masks were rotated by 90 degrees in the
+        # original dataset. The author rotation is kept unchanged; whether it (and a
+        # possible mirroring) matches the SIIM orientation is an open data check
+        # (Section 9.1). §5 keeps image and mask on the same rotation: the image uses
+        # functional.rotate(90), which equals torch.rot90(k=1) on a square grid; the
+        # mask is rotated with rot90 so a non-square native grid is not cropped.
         image = transforms.functional.rotate(image, angle=90)
-        mask = transforms.functional.rotate(mask, angle=90)
+        mask = torch.rot90(torch.from_numpy(mask), k=1, dims=(0, 1)).numpy()
         return {
             "data": image,
-            "mask": np.squeeze(mask, -1) * 255.0,
+            "mask": mask,
             "label": 1,
             "pid": f"{site}_{number}",
+            "image_id": f"{site}_{number}",
         }
 
 

@@ -10,11 +10,10 @@ import glob
 import pandas as pd
 from tqdm import tqdm
 import cv2
-from torchvision import transforms
-import pickle
 from pydicom.pixel_data_handlers.util import apply_voi_lut
 
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
+from sharpness_matters.ptx.corrected.preprocess import eval_transform, minmax_per_image
 from sharpness_matters.config.load_config import cfg
 
 logger = initialize_logger(level="debug")
@@ -24,42 +23,66 @@ HOME = Path(__file__).resolve().parent.parent
 class VinDataset(Dataset):
     def __init__(
         self,
+        manifest_csv: str = None,
         root_dir: str = cfg.ptx["vindr"]["root_dir"],
         img_size: int = 224,
         transform=None,
-        stats_dir=f"{HOME}/output/cache/vin_stats.pkl",
     ):
-        self.root_dir = root_dir
-        # If either vin500neg.txt or vin500pos.txt do not exist, raise an exception
-        if not os.path.exists(f"{HOME}/output/vin500neg.txt") or not os.path.exists(
-            f"{HOME}/output/vin500pos.txt"
-        ):
-            raise FileNotFoundError(
-                f"Required files vin500neg.txt or vin500pos.txt not found in {HOME}/output/. "
-                "Run create_vin_dr_subset.py first to generate these files."
+        """
+        Initialize the VinDr cohort from a frozen ID+label manifest.
+
+        # B (PTX-03 / PTX-08, Section 4.2): the author read vin500neg.txt +
+        #   vin500pos.txt, merged them without deduplication and labelled by POS
+        #   membership, so an ID in both lists counted as a positive twice. New:
+        #   IDs and labels come from a manifest csv (`image_id,label`) in file order,
+        #   with no deduplication (E5 and E5-clean are separate manifests).
+        # B (PTX-27 / Section 5.4): per-image min-max, no dataset mean/std.
+        # B (PTX-26 / Section 5.3): default preprocessing is eval_transform.
+        #   check: tests/corrected/test_data.py::test_vin_manifest_order_labels
+
+        Args:
+            manifest_csv (str): Manifest with `image_id,label` (required)
+            root_dir (str): Directory containing `<image_id>.dicom`
+            img_size (int): Target image size for resizing
+            transform: Explicit preprocessing; defaults to eval_transform
+        """
+        if not manifest_csv:
+            raise RuntimeError(
+                "VinDataset in stage 2 reads an ID+label manifest and no longer reads "
+                "the author's .txt lists. Pass manifest_csv="
+                "manifests/reference_like_combined.csv (E5) or "
+                "manifests/reference_like_clean.csv (E5-clean)."
             )
-        # Read image IDs from vin500neg.txt and vin500pos.txt
-        with open(f"{HOME}/output/vin500neg.txt", "r") as file:
-            data = file.read()
-        self.image_ids = data.replace("\n", " ").split(" ")[:-1]
-        with open(f"{HOME}/output/vin500pos.txt", "r") as file:
-            data = file.read()
-        pos = data.replace("\n", " ").split(" ")[:-1]
-        logger.debug(f"Pos: {len(pos)}, Neg: {len(self.image_ids)}")
-        self.image_ids = self.image_ids + pos
+        self.root_dir = root_dir
+        manifest = pd.read_csv(manifest_csv, dtype={"image_id": str})
+        missing = {"image_id", "label"} - set(manifest.columns)
+        if missing:
+            raise KeyError(f"{manifest_csv} is missing columns {sorted(missing)}")
+        self.image_ids = [str(image_id) for image_id in manifest["image_id"]]
         self.labels = {}
-        for id in self.image_ids:
-            if id in pos:
-                self.labels[id] = 1
-            else:
-                self.labels[id] = 0
-        self.transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize((img_size, img_size), antialias=True),
-            ]
+        for image_id, label in zip(manifest["image_id"], manifest["label"]):
+            key = str(image_id)
+            value = int(label)
+            if key in self.labels and self.labels[key] != value:
+                raise RuntimeError(
+                    f"{manifest_csv} gives image_id {key} conflicting labels "
+                    f"({self.labels[key]} and {value}); a manifest must label each "
+                    "image consistently"
+                )
+            self.labels[key] = value
+        duplicate_rows = len(self.image_ids) - len(self.labels)
+        if duplicate_rows:
+            # The E5 reference-like manifest keeps an ID that the author's lists had
+            # in both NEG and POS (Section 4.2, author semantics: counted twice, both
+            # rows positive). The rows stay; nothing is deduplicated here.
+            logger.info(
+                f"{manifest_csv}: {duplicate_rows} duplicate image_id row(s) kept, "
+                "as in the author loader"
+            )
+        logger.debug(f"Manifest rows: {len(self.image_ids)}")
+        self.transform = (
+            transform if transform is not None else eval_transform(img_size)
         )
-        self.mean, self.std = self.get_global_mean_std(stats_dir)
         logger.info(f"Len of Vin dataset: {len(self.image_ids)}")
 
     def __len__(self):
@@ -69,59 +92,15 @@ class VinDataset(Dataset):
         image_id = self.image_ids[idx]
         dicom_path = os.path.join(self.root_dir, f"{self.image_ids[idx]}.dicom")
         image, pid = self.load_dicom(dicom_path)
-        image = self.z_normalize(image)
+        image = minmax_per_image(image)
         image = self.transform(image)
-        return {"data": image, "label": self.labels[image_id], "mask": image}
-
-    def get_global_mean_std(self, stats_path: str) -> tuple:
-        if os.path.exists(stats_path):
-            with open(stats_path, "rb") as f:
-                data = pickle.load(f)
-                return data["mean"], data["std"]
-        mean, std = 0, 0
-        for idx, id in tqdm(
-            enumerate(self.image_ids),
-            desc="Computing stats for the dataset",
-            total=len(self.image_ids),
-        ):
-            dicom_path = os.path.join(self.root_dir, f"{self.image_ids[idx]}.dicom")
-            image, pid = self.load_dicom(dicom_path)
-            mean += image.mean()
-            std += image.std()
-        mean = mean / len(self.image_ids)
-        std = std / len(self.image_ids)
-        stats_dict = {"mean": mean, "std": std}
-        # Save the dictionary to a file
-        with open(stats_path, "wb") as f:
-            pickle.dump(stats_dict, f)
-        return mean, std
-
-    def z_normalize(self, xray_array: np.ndarray) -> np.ndarray:
-        """
-        Perform Z-normalization on an input X-ray NumPy array.
-        Args:
-            xray_array (np.ndarray): Input X-ray image array.
-        Returns:
-            np.ndarray: Z-normalized X-ray image array.
-        """
-        # Compute mean and standard deviation of the array
-        # mean = np.mean(xray_array)
-        # std = np.std(xray_array)
-
-        # Avoid division by zero
-        if self.std == 0:
-            logger.warning(
-                "Standard deviation of the input array is zero. Cannot perform Z-normalization."
-            )
-            return xray_array
-
-        # Apply Z-normalization
-        normalized_array = (xray_array - self.mean) / self.std
-        # Min-Max scaling to [0, 1]
-        min_val = np.min(normalized_array)
-        max_val = np.max(normalized_array)
-        scaled_array = (normalized_array - min_val) / (max_val - min_val)
-        return scaled_array
+        return {
+            "data": image,
+            "label": self.labels[image_id],
+            "mask": image,
+            "pid": image_id,
+            "image_id": image_id,
+        }
 
     @staticmethod
     def load_dicom(file_path: str) -> np.ndarray:
@@ -242,7 +221,7 @@ class VinDataset(Dataset):
         image_id = self.image_ids[idx]
         dicom_path = os.path.join(self.root_dir, f"{self.image_ids[idx]}.dicom")
         image, pid = self.load_dicom(dicom_path)
-        image = self.z_normalize(image)
+        image = minmax_per_image(image)
 
         image = self.transform(image).squeeze(0).numpy()
 
@@ -256,7 +235,12 @@ class VinDataset(Dataset):
 
 
 if __name__ == "__main__":
+    from sharpness_matters.ptx.corrected.frozen import manifest_dir
+
     img_size = 1024
-    dataset = VinDataset(img_size=img_size)
+    dataset = VinDataset(
+        manifest_csv=str(manifest_dir() / "reference_like_combined.csv"),
+        img_size=img_size,
+    )
     logger.debug(dataset[0]["data"].shape)
     # dataset.visualize_as_jpg(0, '/cnvrg/test.jpg')

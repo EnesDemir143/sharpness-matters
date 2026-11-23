@@ -8,6 +8,26 @@ ptx:
   model:
       checkpoint_dir: "/path/to/your/ptx_checkpoints"  # Where to save model checkpoints
       tuned_checkpoint_dir: "/path/to/your/checkpoints"  # Optional, you only need this if you want to compare cross validation with standard parameters vs tuned parameters
+  vindr_annotations_csv: "/path/to/your/datasets/vindr/train.csv"  # Annotation CSV fed to the author's create_vin_dr_subset.py (E5)
+  corrected:  # Stage 2 (B) settings; every value not changed by a correction item is the author's value (baseline_correction.md §11)
+      manifest_dir: "manifests"  # Relative to the repository root
+      k_folds: 5
+      seed: 42
+      max_epochs: 20  # E_max, author num_epochs
+      patience: 5  # epochs; author patience=5 / val_check_interval=0.5 = 10 half-epoch checks
+      min_delta: 0.0  # Lightning EarlyStopping default
+      lr: 1.0e-4
+      batch_size: 8
+      target_sensitivity: 0.95  # OOF threshold: highest tau with sensitivity >= target, decision p >= tau
+      resize:
+          interpolation: "bilinear"
+          antialias: true  # order: ToTensor -> Resize, identical for train/val/test
+      constant_image_value: 0.0  # per-image min-max output when max == min
+      saliency_thresholds: [0.25, 0.5, 0.75]
+      e5:
+          pythonhashseed: "0"  # Recorded hash seed for the author's set() ordering
+          clean_fill_seed: 42  # author random.seed(42)
+          negative_rule: "class_name != 'Pneumothorax'"  # author candidate rule; E5-clean additionally removes POS
 pneumonia:
   rsna_pneumonia:
     root_dir: "/path/to/your/datasets"

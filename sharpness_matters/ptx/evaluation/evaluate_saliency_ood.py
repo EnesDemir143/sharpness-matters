@@ -1,42 +1,59 @@
 """
 Module for performing saliency evaluation experiments on the OOD Dataset.
 
-This module evaluates saliency maps produced by different model architectures (e.g., DenseNet, ResNet). 
+This module evaluates saliency maps produced by different model architectures (e.g., DenseNet, ResNet).
 It selects a subset of the dataset based on the specified evaluation mode, runs predictions in chunks
 (Computation is done chunk wise to prevent crashes due to CPU memory over-utilization)
 for each cross-validation fold, computes metrics such as Intersection over Union (IoU),
 Precision (%-IN), and coverage, and finally summarizes the results.
 
+B (PTX-18 / §7.3): current -> the fold checkpoint was `os.listdir(...)[0]` and the chunk cache
+was a fixed directory reused with `exist_ok=True`; problem -> the evaluated weights were not the
+recorded ones and stale chunks could be averaged in; new -> checkpoints come from the cv record
+(`load_cv_record`, `fold_checkpoints`), every chunk records its checkpoint SHA-256, and the cache
+directory is unique per run. A missing fold, a mismatched ImageId set or a different checkpoint
+raises instead of being averaged into a partial ensemble.
+B (PTX-04 / §7.4): one CSV and one JSON summary per (model, img_size, dataset, rule); saliency is
+scored for every GT-positive image from its positive-class CAM, independent of the decision.
+B (protocol §6): B evaluates input size 512 only; `train_kfold.main` and `evaluate_kfold` use
+[512] and a cv record exists only for 512, so the author's 64..1024 sweep is not run here.
+This script evaluates PTX-498 only (`OODTestDataset`); it never constructs `VinDataset`, so the
+E5 manifest (`manifest_csv`) is not a parameter of this entry point.
+
 Usage:
     Run this module directly to execute the experiments:
         python3 evaluate_saliency_ood.py
-    Output is stored as a csv named "saliency_thresholded_{model_name}_{threshold}.csv"
+    Output is stored as
+    `output/saliency_eval/{model_name}/saliency_{dataset}_{model}_{img_size}_{rule}.csv`
+    and a per-model table `output/saliency_eval/saliency_thresholded_{dataset}_{model}_{rule}.csv`.
 """
 
-import os
-from pathlib import Path
 import gc
 import shutil
-import numpy as np
-from PIL import Image
-import pytorch_lightning as pl
+from pathlib import Path
 import torch
-from torch.utils.data import DataLoader, Dataset
 import pandas as pd
-from typing import Dict, Any, List, Union
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader, Dataset
+from typing import Dict, Any, List, Optional, Tuple, Union
 
+from sharpness_matters.ptx.corrected.cv_record import fold_checkpoints, load_cv_record
 from sharpness_matters.ptx.datasets.ptx498_dataset import OODTestDataset
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
 from sharpness_matters.ptx.utils.saliency_eval import (
-    predict_fold_chunked,
+    RULE_LEGACY,
+    RULE_MAIN,
     compute_scores_chunked,
+    create_cache_dir,
+    fold_checkpoint_shas,
+    predict_fold_chunked,
+    summary_table,
+    write_saliency_outputs,
 )
-from sharpness_matters.config.load_config import cfg
 
 logger = initialize_logger(level="debug")
 HOME = Path(__file__).resolve().parent.parent
-CHECKPOINT_DIR = cfg.ptx.model.checkpoint_dir
 
 
 def collate_fn(
@@ -44,6 +61,9 @@ def collate_fn(
 ) -> Dict[str, Union[torch.Tensor, List[Any]]]:
     """
     Custom collate function for DataLoader to handle mixed tensor and list data.
+
+    `mask` must stay a list: PTX-498 GT masks are on their native NIfTI grid (contract 6) and
+    that grid differs per image, so stacking would fail (PTX-02 / §7.1).
 
     Args:
         batch (List[Dict[str, Any]]): List of sample dictionaries
@@ -61,142 +81,140 @@ def collate_fn(
     return collated
 
 
+def _load_fold_model(
+    checkpoint_path: str, model_name: str, device: torch.device
+) -> Tuple[torch.nn.Module, List[Any]]:
+    """Load one fold checkpoint with the author's target layer (unchanged CAM method)."""
+    if "densenet" not in model_name and "resnet" not in model_name:
+        raise ValueError(f"unknown model name: {model_name!r}")
+    model = CNNBinaryClassifier.load_from_checkpoint(
+        checkpoint_path, map_location=device
+    )
+    if "densenet" in model_name:
+        target_layers = [model.model.features.denseblock4]
+    else:
+        target_layers = [model.model.layer4[-1].conv3]
+    model.eval()
+    model.to(device)
+    return model, target_layers
+
+
 def run_experiment(
     dataset: Dataset,
     img_size: int,
     model_name: str,
-    threshold: float = 0.5,
+    dataset_name: str = "ptx498_ood",
+    validation_mode: str = "ood",
     chunk_size: int = 250,
+    save_maps: bool = True,
+    output_dir: Optional[str] = None,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-) -> Dict[str, Union[str, float]]:
+) -> Dict[str, Dict[str, Any]]:
     """
-    Run saliency evaluation experiment for a given dataset and model configuration.
+    Run saliency evaluation experiment for a given OOD dataset and model configuration.
 
     Args:
-        dataset (Dataset): PyTorch dataset containing OOD test samples
+        dataset (Dataset): masked PyTorch dataset; `mask` is uint8 {0,1} on the native grid
         img_size (int): Input image size for the model
         model_name (str): Name of the model architecture ('resnet' or 'densenet')
-        threshold (float): Threshold for saliency map evaluation
+        dataset_name (str): dataset label used in the output file names and the summary
+        validation_mode (str): 'holdout' or 'ood' (visualisation directory only)
         chunk_size (int): Size of chunks for batch processing
+        save_maps (bool): Write the author's map visualisations under `ptx/output`
+        output_dir (Optional[str]): directory of the per-run CSV/JSON; defaults to
+            `output/saliency_eval/{model_name}`
 
     Returns:
-        Dict[str, Union[str, float]]: Dictionary containing evaluation metrics (IoU, precision, coverage, etc.)
+        Dict[str, Dict[str, Any]]: one result per fold-aggregation rule (`main`, `legacy`)
     """
-    # For chunked prediction, use a DataLoader with batch_size=1.
-    pred_loader = DataLoader(
-        dataset, batch_size=4, shuffle=False, num_workers=8, pin_memory=True
+    record = load_cv_record(model_name, img_size)
+    checkpoints = fold_checkpoints(record)
+    checkpoint_sha256s = fold_checkpoint_shas(record)
+    if len(checkpoints) != len(checkpoint_sha256s):
+        raise RuntimeError(
+            f"cv record lists {len(checkpoints)} checkpoints but "
+            f"{len(checkpoint_sha256s)} checkpoint hashes"
+        )
+    cache_dir = create_cache_dir(
+        f"{HOME}/output", dataset_name, model_name, img_size, checkpoint_sha256s
     )
-    # Create a temporary cache directory for chunk predictions.
-    cache_dir = f"{HOME}/output/chunk_predictions_{model_name}_{img_size}"
-    os.makedirs(cache_dir, exist_ok=True)
-    # For each of the 5 folds, load the checkpoint and save chunked predictions to cache dir.
-    for fold in range(5):
-        if "densenet" in model_name or "resnet" in model_name:
-            checkpoint_dir = f"{CHECKPOINT_DIR}/{model_name}/{model_name}_{img_size}_logs/lightning_logs/version_{fold}/checkpoints/"
-            ckpt_file = os.listdir(checkpoint_dir)[0]
-            checkpoint_path = os.path.join(checkpoint_dir, ckpt_file)
+    if output_dir is None:
+        output_dir = f"{HOME}/output/saliency_eval/{model_name}"
+    # Batch size 4 as in the author's runner; the explicit collate keeps `mask` a list.
+    pred_loader = DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+    try:
+        for fold, checkpoint_path in enumerate(checkpoints):
             if device.type == "cpu":
                 logger.warning("Device is CPU; saliency evaluation may be slow.")
-            model = CNNBinaryClassifier.load_from_checkpoint(
-                checkpoint_path, map_location=device
+            model, target_layers = _load_fold_model(checkpoint_path, model_name, device)
+            predict_fold_chunked(
+                pred_loader,
+                model,
+                target_layers,
+                fold,
+                checkpoint_sha256=checkpoint_sha256s[fold],
+                checkpoint_path=checkpoint_path,
+                chunk_size=chunk_size,
+                output_dir=str(cache_dir),
             )
-            if "densenet" in model_name:
-                target_layers = [model.model.features.denseblock4]
-            elif "resnet" in model_name:
-                target_layers = [model.model.layer4[-1].conv3]
-        else:
-            raise Exception("Unknown model name")
-        model.eval()
-        model.to(device)
-        predict_fold_chunked(
-            pred_loader,
-            model,
-            target_layers,
-            fold,
+            del model
+            gc.collect()
+        results = compute_scores_chunked(
+            dataset,
+            str(cache_dir),
+            record,
+            model_name,
+            img_size,
+            dataset_name,
+            validation_mode=validation_mode,
             chunk_size=chunk_size,
-            output_dir=cache_dir,
+            save_maps=save_maps,
         )
-        del model
-        gc.collect()
-    # Compute ensemble scores from the saved chunked predictions.
-    iou, precision, coverage = compute_scores_chunked(
-        dataset,
-        cache_dir,
-        model_name,
-        img_size,
-        collate_fn,
-        logger,
-        validation_mode="ood",
-        threshold=threshold,
-        chunk_size=chunk_size,
-    )
-    if len(iou) == 0:
-        logger.warning(
-            f"No valid predictions found for threshold {threshold} at image size {img_size}."
-        )
-        return {
-            "iou": "N/A",
-            "precision": "N/A",
-            "coverage": "N/A",
-            "num_accurate": "N/A",
-            "complete_miss": "N/A",
-        }
-    # Summarize the evaluation metrics
-    complete_miss = sum(1 for v in iou.values() if v == 0)
-    complete_miss_percent = f"{np.round(100 * complete_miss / len(dataset), 2)}%"
-    iou_values = np.array(list(iou.values()))
-    precision_values = np.array(list(precision.values()))
-    coverage = np.mean(list(coverage.values()))
-    summary = {
-        "iou": f"{iou_values.mean():.4f} +- {iou_values.std():.4f}",
-        "precision": f"{precision_values.mean():.4f} +- {precision_values.std():.4f}",
-        "coverage": coverage,
-        "num_accurate": f"{np.round(100 * len(iou) / len(dataset), 2)}%",
-        "complete_miss": complete_miss_percent,
-    }
-    # Save computed metrics
-    save_path = f"{HOME}/output/saliency_eval/{model_name}"
-    os.makedirs(save_path, exist_ok=True)
-    np.save(os.path.join(save_path, f"oodiou_{img_size}_{threshold}.npy"), iou)
-    np.save(
-        os.path.join(save_path, f"oodprecision_{img_size}_{threshold}.npy"), precision
-    )
-    # Delete the temporary cache directory after processing.
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir)
-    gc.collect()
-    return summary
+    finally:
+        # The cache directory is unique per run (PTX-18), so it is removed in every
+        # outcome; a killed run leaves one behind and the next run raises on it instead
+        # of silently reusing partial chunks.
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    write_saliency_outputs(results, output_dir, dataset_name, model_name, img_size)
+    return results
 
 
 if __name__ == "__main__":
     seed = 42
-    batch_size = 1
     pl.seed_everything(seed)
     generator = torch.Generator()
     generator.manual_seed(seed)
 
+    dataset_name = "ptx498_ood"
     model_names = ["resnet", "densenet"]
-    thresholds = [0.25, 0.75, 0.5]
-    for threshold in thresholds:
-        for model_name in model_names:
-            out = []
-            for img_size in [64, 128, 224, 512, 768, 1024]:
-                torch.cuda.empty_cache()
-                dataset = OODTestDataset(img_size=img_size)
-                logger.info(
-                    f"Running: Image size: {img_size}, Threshold: {threshold}, Model: {model_name}"
-                )
-                res = run_experiment(
-                    dataset, img_size, model_name, threshold=threshold, chunk_size=20
-                )
-                res["img_size"] = img_size
-                out.append(res)
-                df = pd.DataFrame(out)
-                columns_order = ["img_size"] + [
-                    col for col in df.columns if col != "img_size"
-                ]
-                df = df[columns_order]
-                df.to_csv(
-                    f"{HOME}/output/saliency_thresholded_ood_{model_name}_{threshold}.csv",
-                    index=False,
-                )
+    output_root = f"{HOME}/output/saliency_eval"
+    for model_name in model_names:
+        table_rows = {RULE_MAIN: [], RULE_LEGACY: []}
+        for img_size in [512]:  # B (protocol §6): B evaluates 512 only
+            torch.cuda.empty_cache()
+            dataset = OODTestDataset(img_size=img_size)
+            logger.info(f"Running: Image size: {img_size}, Model: {model_name}")
+            results = run_experiment(
+                dataset,
+                img_size,
+                model_name,
+                dataset_name,
+                validation_mode="ood",
+                chunk_size=20,
+                output_dir=f"{output_root}/{model_name}",
+            )
+            for rule in (RULE_MAIN, RULE_LEGACY):
+                table_rows[rule].extend(summary_table(results[rule]))
+            logger.debug(f"Results: {img_size} {model_name} done")
+        for rule in (RULE_MAIN, RULE_LEGACY):
+            df = pd.DataFrame(table_rows[rule])
+            table_path = f"{output_root}/saliency_thresholded_{dataset_name}_{model_name}_{rule}.csv"
+            df.to_csv(table_path, index=False)
+            logger.debug(f"Saved {table_path}")

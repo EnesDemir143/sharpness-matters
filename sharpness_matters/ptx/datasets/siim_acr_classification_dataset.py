@@ -10,17 +10,68 @@ import glob
 import pandas as pd
 from tqdm import tqdm
 import cv2
-from torchvision import transforms
-import pickle
 from sklearn.model_selection import train_test_split
 from typing import Dict, Any, Tuple, Union, List, Optional
 
 
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
+from sharpness_matters.ptx.corrected.preprocess import eval_transform, minmax_per_image
 from sharpness_matters.config.load_config import cfg
 
 HOME_DIR = Path(__file__).resolve().parent.parent
 logger = initialize_logger(level="info")
+
+
+def index_dicom_files(file_paths: List[str]) -> Tuple[Dict[str, str], List[str]]:
+    """Map ImageId -> DICOM path by exact filename stem; list ambiguous stems.
+
+    # B (Section 10.3 / Y10): the old lookup was `image_id in path` over an unsorted
+    #   list, so a substring match (or the first of several files) decided the study.
+    #   New: the ImageId is the DICOM filename stem, matched exactly, in one dict.
+    #   check: tests/corrected/test_data.py::test_siim_file_map_rejects_*
+    """
+    file_map: Dict[str, str] = {}
+    duplicate_ids: List[str] = []
+    for path in file_paths:
+        stem = Path(path).stem
+        if stem in file_map:
+            if str(file_map[stem]) != str(path) and stem not in duplicate_ids:
+                duplicate_ids.append(stem)
+            continue
+        file_map[stem] = path
+    return file_map, duplicate_ids
+
+
+def require_unique_files(
+    image_ids: List[str], file_map: Dict[str, str], duplicate_ids: List[str]
+) -> None:
+    """Raise unless every ImageId maps to exactly one file (Section 10.3 / Y10)."""
+    missing = sorted(image_id for image_id in image_ids if image_id not in file_map)
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} ImageId(s) have no DICOM file with a matching filename "
+            f"stem, e.g. {missing[:5]}"
+        )
+    duplicated = set(duplicate_ids)
+    ambiguous = sorted(image_id for image_id in image_ids if image_id in duplicated)
+    if ambiguous:
+        raise RuntimeError(
+            f"{len(ambiguous)} ImageId(s) map to more than one DICOM file, e.g. "
+            f"{ambiguous[:5]}"
+        )
+
+
+def siim_labels_from_rle(label_df: pd.DataFrame) -> Dict[str, int]:
+    """ImageId -> 1 when any RLE row differs from ``" -1"`` (the author's rule).
+
+    # B (PTX-27 / Section 5.4): labels used to be cached together with a global
+    #   mean/std that was computed by reading every DICOM. Labels are pure CSV work;
+    #   the statistics are gone, so the cache is gone and both SIIM datasets derive
+    #   the split from this one function (identical labels -> identical split).
+    """
+    encoded = label_df[" EncodedPixels"].astype(str)
+    has_mask = (encoded != " -1").groupby(label_df["ImageId"]).any()
+    return {image_id: int(value) for image_id, value in has_mask.items()}
 
 
 class ChestXrayDataset(Dataset):
@@ -37,13 +88,15 @@ class ChestXrayDataset(Dataset):
         transform: Optional[Any] = None,
         test_size: float = 0.1,
         split_seed: int = 42,
-        stats_dir: str = os.path.join(
-            HOME_DIR, "output", "cache", "siim_acr_stats.pkl"
-        ),
-        label_cache_dir: str = os.path.join(HOME_DIR, "output", "cache", "label.pkl"),
     ):
         """
         Initialize SIIM-ACR chest X-ray classification dataset.
+
+        # B (PTX-27 / Section 5.4): the dataset no longer computes or loads a global
+        #   mean/std (the old stats pickle is gone); __getitem__ applies per-image
+        #   min-max. # B (PTX-26 / Section 5.3): the default preprocessing is the
+        #   shared eval_transform policy. # B (Section 10.3 / Y10): ImageIds resolve
+        #   through an exact filename-stem map built once here.
 
         Args:
             file_paths (List[str]): List of paths to DICOM files
@@ -53,41 +106,16 @@ class ChestXrayDataset(Dataset):
             transform (Optional[Any]): Image transformations to apply
             test_size (float): Fraction of data for test split
             split_seed (int): Random seed for train/test split
-            stats_dir (str): Path to cached dataset statistics
-            label_cache_dir (str): Path to cached labels
         """
         self.file_paths = file_paths
+        self.file_map, self.duplicate_ids = index_dicom_files(file_paths)
         label_df = pd.read_csv(label_dir)
         image_id_arr = label_df["ImageId"].unique()
         self.image_ids = list(image_id_arr)
-        if os.path.exists(label_cache_dir) and os.path.exists(stats_dir):
-            try:
-                with open(label_cache_dir, "rb") as handle:
-                    self.labels = pickle.load(handle)
-            except Exception as e:
-                logger.error(e)
-            try:
-                with open(stats_dir, "rb") as f:
-                    self.global_stats = pickle.load(f)
-            except Exception as e:
-                logger.error(e)
-        else:
-            logger.info(
-                f"Cache dir for saved labels and dataset stats not found. Generating split and labels."
-            )
-            os.makedirs(os.path.dirname(label_cache_dir), exist_ok=True)
-            os.makedirs(os.path.dirname(stats_dir), exist_ok=True)
-            self.labels, self.global_stats = self.process_labels(label_df)
-            with open(label_cache_dir, "wb") as handle:
-                pickle.dump(self.labels, handle)
-            with open(stats_dir, "wb") as f:
-                pickle.dump(self.global_stats, f)
-        self.mean, self.std = self.global_stats["mean"], self.global_stats["std"]
+        self.labels = self.process_labels(label_df)
 
         indices = np.arange(len(self.image_ids))
-        labels = []
-        for i in tqdm(self.image_ids, desc=f"Generating {split} split"):
-            labels.append(self.labels[i])
+        labels = [self.labels[i] for i in self.image_ids]
         train_idx, test_idx = train_test_split(
             indices,
             stratify=labels,
@@ -99,6 +127,7 @@ class ChestXrayDataset(Dataset):
         else:
             indices = test_idx
         self.image_ids = list(np.array(self.image_ids)[indices])
+        require_unique_files(self.image_ids, self.file_map, self.duplicate_ids)
         self.labels = {i: self.labels[i] for i in self.image_ids}
         pos, neg = 0, 0
         for val in self.labels.values():
@@ -108,13 +137,8 @@ class ChestXrayDataset(Dataset):
                 neg += 1
         self.class_count = {1: pos, 0: neg}
         logger.info(f"Class counts: {self.class_count}")
-        # Transformations
-        self.preprocess = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize((img_size, img_size), antialias=True),
-            ]
-        )
+        # Transformations: one resize policy (PTX-26), per-image min-max (PTX-27)
+        self.preprocess = eval_transform(img_size)
         self.transform = transform
         logger.info(f"Initialzed dataset of size {len(self.labels)}")
 
@@ -123,17 +147,12 @@ class ChestXrayDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str]]:
         image_id = self.image_ids[idx]
-        # Load the DICOM file
-        file_idx = list(
-            filter(
-                lambda x: image_id in self.file_paths[x], range(len(self.file_paths))
-            )
-        )[0]
-        dicom_path = self.file_paths[file_idx]
+        # Load the DICOM file (exact ImageId == filename stem, Section 10.3 / Y10)
+        dicom_path = self.file_map[image_id]
         image, pid = self.load_dicom(dicom_path)
 
         # Apply transformations
-        image = self.z_normalize(image)
+        image = minmax_per_image(image)
         if self.transform:
             image = self.transform(image)
         else:
@@ -142,36 +161,7 @@ class ChestXrayDataset(Dataset):
         # image = torch.tensor(image, dtype=torch.float32) # Add channel dimension
         image = image.float()
         label = torch.tensor(self.labels[image_id], dtype=torch.long)
-        return {"data": image, "label": label, "pid": image_id}
-
-    def z_normalize(self, xray_array: np.ndarray) -> np.ndarray:
-        """
-        Perform Z-normalization on an input X-ray NumPy array.
-
-        Args:
-            xray_array (np.ndarray): Input X-ray image array
-
-        Returns:
-            np.ndarray: Z-normalized and min-max scaled X-ray image array
-        """
-        # Compute mean and standard deviation of the array
-        # mean = np.mean(xray_array)
-        # std = np.std(xray_array)
-
-        # Avoid division by zero
-        if self.std == 0:
-            logger.warning(
-                "Standard deviation of the input array is zero. Cannot perform Z-normalization."
-            )
-            return xray_array
-
-        # Apply Z-normalization
-        normalized_array = (xray_array - self.mean) / self.std
-        # Min-Max scaling to [0, 1]
-        min_val = np.min(normalized_array)
-        max_val = np.max(normalized_array)
-        scaled_array = (normalized_array - min_val) / (max_val - min_val)
-        return scaled_array
+        return {"data": image, "label": label, "pid": image_id, "image_id": image_id}
 
     def get_weights(self) -> List[float]:
         """
@@ -185,44 +175,21 @@ class ChestXrayDataset(Dataset):
             weights.append(1 / self.class_count[val])
         return weights
 
-    def process_labels(
-        self, df: pd.DataFrame
-    ) -> Tuple[Dict[str, int], Dict[str, float]]:
+    def process_labels(self, df: pd.DataFrame) -> Dict[str, int]:
         """
-        Process labels from CSV file and compute global statistics.
+        Process labels from CSV file (no dataset statistics are computed).
+
+        # B (PTX-27 / Section 5.4): the old version also read every DICOM to average
+        #   per-image mean/std into a "global" statistic. That statistic is no longer
+        #   used, so labels are pure CSV work here.
 
         Args:
             df (pd.DataFrame): DataFrame containing image IDs and RLE encodings
 
         Returns:
-            Tuple[Dict[str, int], Dict[str, float]]: Labels dictionary and statistics dictionary
+            Dict[str, int]: Labels keyed by image ID
         """
-        image_id_arr = df["ImageId"].unique()
-        labels = {}
-        pos, neg = 0, 0
-        mean, std = 0, 0
-        for index, image_id in tqdm(enumerate(image_id_arr), total=len(image_id_arr)):
-            idx = list(
-                filter(
-                    lambda x: image_id in self.file_paths[x],
-                    range(len(self.file_paths)),
-                )
-            )
-            dataset = pydicom.dcmread(self.file_paths[idx[0]])
-            image_data = dataset.pixel_array
-            mean += image_data.mean()
-            std += image_data.std()
-            record_arr = df[df["ImageId"] == image_id]
-            # Visualize patient has multi segment
-            label = 0
-            for _, row in record_arr.iterrows():
-                if row[" EncodedPixels"] != " -1":
-                    label = 1
-            labels[image_id] = label
-        mean = mean / len(image_id_arr)
-        std = std / len(image_id_arr)
-        stats = {"mean": mean, "std": std}
-        return labels, stats
+        return siim_labels_from_rle(df)
 
     @staticmethod
     def load_dicom(file_path: str) -> Tuple[np.ndarray, Optional[str]]:
@@ -249,16 +216,11 @@ class ChestXrayDataset(Dataset):
             idx (int): Index of the image in the dataset
             output_path (str): Path to save the JPG file
         """
-        # Load and preprocess the image
+        # Load and preprocess the image (exact file map, per-image min-max)
         image_id = self.image_ids[idx]
-        file_idx = list(
-            filter(
-                lambda x: image_id in self.file_paths[x], range(len(self.file_paths))
-            )
-        )[0]
-        dicom_path = self.file_paths[file_idx]
+        dicom_path = self.file_map[image_id]
         image, _ = self.load_dicom(dicom_path)
-        image = self.z_normalize(image)
+        image = minmax_per_image(image)
         image = self.preprocess(image).squeeze(0).cpu().numpy()
 
         # Convert to 8-bit image (range [0, 255])

@@ -10,14 +10,18 @@ import glob
 import pandas as pd
 from tqdm import tqdm
 import cv2
-from torchvision import transforms
-import pickle
 from sklearn.model_selection import train_test_split
 from typing import Dict, Any, Tuple, Union, List, Optional
 
 HOME_DIR = Path(__file__).resolve().parent.parent
 
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
+from sharpness_matters.ptx.corrected.preprocess import eval_transform, minmax_per_image
+from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
+    index_dicom_files,
+    require_unique_files,
+    siim_labels_from_rle,
+)
 from sharpness_matters.config.load_config import cfg
 
 logger = initialize_logger(level="debug")
@@ -100,13 +104,17 @@ class ChestXrayDataset(Dataset):
         transform: Optional[Any] = None,
         test_size: float = 0.1,
         split_seed: int = 42,
-        stats_dir: str = os.path.join(
-            HOME_DIR, "output", "cache", "siim_acr_stats.pkl"
-        ),
-        label_cache_dir: str = os.path.join(HOME_DIR, "output", "cache", "label.pkl"),
     ):
         """
         Initialize SIIM-ACR chest X-ray dataset.
+
+        # B (PTX-02 / Section 7.1): the GT mask is no longer resized to the input size;
+        #   it stays on the 1024x1024 RLE grid as uint8 {0,1}. # B (PTX-27 / Section
+        #   5.4): per-image min-max, no dataset mean/std and no stats pickle. # B
+        #   (PTX-26 / Section 5.3): default preprocessing is eval_transform. # B
+        #   (Section 7.4 / Y4 and Section 10.3 / Y10): `pid`/`image_id` are the
+        #   ImageId and files resolve by exact filename stem.
+        #   check: tests/corrected/test_data.py::test_siim_masked_loader_*
 
         Args:
             file_paths (List[str]): List of paths to DICOM files
@@ -116,30 +124,15 @@ class ChestXrayDataset(Dataset):
             transform (Optional[Any]): Image transformations to apply
             test_size (float): Fraction of data for test split
             split_seed (int): Random seed for train/test split
-            stats_dir (str): Path to cached dataset statistics
-            label_cache_dir (str): Path to cached labels
         """
         self.file_paths = file_paths
+        self.file_map, self.duplicate_ids = index_dicom_files(file_paths)
         label_df = pd.read_csv(label_dir)
         image_id_arr = label_df["ImageId"].unique()
         self.image_ids = list(image_id_arr)
-        if os.path.exists(stats_dir) and os.path.exists(label_cache_dir):
-            with open(stats_dir, "rb") as f:
-                self.global_stats = pickle.load(f)
-            self.mean, self.std = self.global_stats["mean"], self.global_stats["std"]
-            with open(label_cache_dir, "rb") as f:
-                tmp_labels = pickle.load(f)
-        else:
-            raise RuntimeError(
-                f"Required cache files not found.\n"
-                f"Expected stats at: {stats_dir}\n"
-                f"Expected labels at: {label_cache_dir}\n"
-                f"Please run siim_acr_classification_dataset.py first to generate the stratified train/test split and statistics."
-            )
+        label_lookup = siim_labels_from_rle(label_df)
 
-        labels = []
-        for i in tqdm(self.image_ids, desc=f"Generating {split} split"):
-            labels.append(tmp_labels[i])
+        labels = [label_lookup[i] for i in self.image_ids]
         indices = np.arange(len(self.image_ids))
         train_idx, test_idx = train_test_split(
             indices,
@@ -152,8 +145,8 @@ class ChestXrayDataset(Dataset):
         else:
             indices = test_idx
         self.image_ids = list(np.array(self.image_ids)[indices])
-        self.labels = self.process_labels(label_df)
-        self.labels = {i: self.labels[i] for i in self.image_ids}
+        require_unique_files(self.image_ids, self.file_map, self.duplicate_ids)
+        self.labels = self.process_labels(label_df, self.image_ids)
         pos, neg = 0, 0
         for i in self.labels.values():
             val = i["label"]
@@ -163,15 +156,9 @@ class ChestXrayDataset(Dataset):
                 neg += 1
         self.class_count = {1: pos, 0: neg}
         logger.info(f"Class counts: {self.class_count}")
-        # Transformations
-        self.preprocess = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize((img_size, img_size), antialias=True),
-            ]
-        )
+        # Transformations: one resize policy (PTX-26); the mask is never resized
+        self.preprocess = eval_transform(img_size)
         self.transform = transform
-        self.resize = transforms.Resize((img_size, img_size), antialias=True)
         logger.info(f"Initialzed dataset of size {len(self.labels)}")
 
     def __len__(self) -> int:
@@ -179,94 +166,62 @@ class ChestXrayDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str]]:
         image_id = self.image_ids[idx]
-        # Load the DICOM file
-        file_idx = list(
-            filter(
-                lambda x: image_id in self.file_paths[x], range(len(self.file_paths))
-            )
-        )[0]
-        dicom_path = self.file_paths[file_idx]
-        image, pid = self.load_dicom(dicom_path)
-        mask = torch.tensor(self.labels[image_id]["mask"], dtype=torch.long)
-        mask = self.resize(mask.unsqueeze(0)).squeeze(0)
+        # Load the DICOM file (exact ImageId == filename stem, Section 10.3 / Y10)
+        dicom_path = self.file_map[image_id]
+        image, _ = self.load_dicom(dicom_path)
+        # GT mask on the reference annotation grid (1024x1024), uint8 {0,1}: no resize
+        mask = torch.from_numpy(self.labels[image_id]["mask"])
         label = torch.tensor(self.labels[image_id]["label"], dtype=torch.long)
 
         # Apply transformations
-        image = self.z_normalize(image)
+        image = minmax_per_image(image)
         if self.transform:
             image = self.transform(image)
         else:
             image = self.preprocess(image)
         image = image.float()
-        return {"data": image, "mask": mask, "label": label, "pid": pid}
+        return {
+            "data": image,
+            "mask": mask,
+            "label": label,
+            "pid": image_id,
+            "image_id": image_id,
+        }
 
     def process_labels(
-        self, df: pd.DataFrame
+        self, df: pd.DataFrame, image_ids: List[str]
     ) -> Dict[str, Dict[str, Union[np.ndarray, int]]]:
         """
-        Process labels from CSV file and create masks.
+        Process masks and labels for the selected image IDs.
+
+        # B (PTX-02 / Section 7.1): masks are built on the 1024x1024 RLE grid and
+        #   binarised to uint8 {0,1} (the old version stored 0/255 and let the caller
+        #   resize, which eroded thin foreground). Only the split's IDs are parsed;
+        #   labels come from the shared CSV rule so the split matches the
+        #   classification dataset exactly.
 
         Args:
             df (pd.DataFrame): DataFrame containing image IDs and RLE encodings
+            image_ids (List[str]): Image IDs to build masks for
 
         Returns:
-            Dict[str, Dict[str, Union[np.ndarray, int]]]: Dictionary mapping image IDs to labels and masks
+            Dict[str, Dict[str, Union[np.ndarray, int]]]: image ID -> mask and label
         """
-        image_id_arr = df["ImageId"].unique()
         labels = {}
-        for index, image_id in tqdm(
-            enumerate(image_id_arr), total=len(image_id_arr), desc="Processing labels"
-        ):
-            if image_id not in self.image_ids:
-                continue
-            idx = list(
-                filter(
-                    lambda x: image_id in self.file_paths[x],
-                    range(len(self.file_paths)),
-                )
-            )
-            dataset = pydicom.dcmread(self.file_paths[idx[0]])
-            image_data = dataset.pixel_array
-            record_arr = df[df["ImageId"] == image_id]
+        records_by_id = {image_id: rows for image_id, rows in df.groupby("ImageId")}
+        for image_id in tqdm(image_ids, desc="Processing labels"):
+            record_arr = records_by_id.get(image_id)
+            if record_arr is None:
+                raise RuntimeError(f"No RLE rows for ImageId {image_id}")
             # Visualize patient has multi segment
             label = 0
-            mask = np.zeros((1024, 1024))
+            mask = np.zeros((1024, 1024), dtype=np.uint8)
             for _, row in record_arr.iterrows():
                 if row[" EncodedPixels"] != " -1":
-                    mask_ = rle2mask(row[" EncodedPixels"], 1024, 1024).T
-                    mask[mask_ == 255] = 255
+                    mask[rle2mask(row[" EncodedPixels"], 1024, 1024).T == 255] = 1
                     label = 1
             labels[image_id] = {"mask": mask, "label": label}
         return labels
-
-    def z_normalize(self, xray_array: np.ndarray) -> np.ndarray:
-        """
-        Perform Z-normalization on an input X-ray NumPy array.
-
-        Args:
-            xray_array (np.ndarray): Input X-ray image array
-
-        Returns:
-            np.ndarray: Z-normalized and min-max scaled X-ray image array
-        """
-        # Compute mean and standard deviation of the array
-        self.mean = np.mean(xray_array)
-        self.std = np.std(xray_array)
-
-        # Avoid division by zero
-        if self.std == 0:
-            logger.warning(
-                "Standard deviation of the input array is zero. Cannot perform Z-normalization."
-            )
-            return xray_array
-
-        # Apply Z-normalization
-        normalized_array = (xray_array - self.mean) / self.std
-        # Min-Max scaling to [0, 1]
-        min_val = np.min(normalized_array)
-        max_val = np.max(normalized_array)
-        scaled_array = (normalized_array - min_val) / (max_val - min_val)
-        return scaled_array
 
     @staticmethod
     def load_dicom(file_path: str) -> Tuple[np.ndarray, Optional[str]]:
@@ -298,17 +253,12 @@ class ChestXrayDataset(Dataset):
         Returns:
             Dict[str, Optional[Union[str, int]]]: Dictionary containing age, sex, and patient_id
         """
-        # Find the file path for this image_id
-        file_idx = list(
-            filter(
-                lambda x: image_id in self.file_paths[x], range(len(self.file_paths))
-            )
-        )
-        if not file_idx:
+        # Find the file path for this image_id (exact filename stem, Section 10.3)
+        dicom_path = self.file_map.get(image_id)
+        if dicom_path is None:
             logger.error(f"Could not find file path for image_id: {image_id}")
             return {"image_id": image_id, "age": None, "sex": None, "patient_id": None}
 
-        dicom_path = self.file_paths[file_idx[0]]
         try:
             dicom = pydicom.dcmread(dicom_path)
 
@@ -426,11 +376,15 @@ class ChestXrayDataset(Dataset):
         if image.shape[:2] != mask.shape:
             raise ValueError("Image and mask must have the same height and width.")
         image = np.array(image * 255).astype(np.uint8)
-        # Convert binary mask to RGB if necessary
+        # Convert binary mask to RGB if necessary. GT masks are uint8 {0,1}
+        # (PTX-02 / Section 7.1), so the foreground is scaled to 255 for display;
+        # a 0/255 mask (e.g. the thresholded CAM passed by the scorer) is unchanged.
         if len(mask.shape) == 2:  # Single-channel binary or multi-class mask
+            mask = np.asarray(mask)
+            foreground = np.where(mask > 0, 255, 0).astype(np.uint8)
             colored_mask = np.zeros_like(image, dtype=np.uint8)
             for c in range(3):
-                colored_mask[..., c] = mask * mask_color[c]  # Apply mask color
+                colored_mask[..., c] = foreground * mask_color[c]  # Apply mask color
         else:
             colored_mask = mask  # Assume already RGB for multi-class
 
