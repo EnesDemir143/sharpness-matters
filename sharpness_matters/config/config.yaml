@@ -2,7 +2,7 @@ ptx:
   siim_acr:
     root_dir: "/Users/enesdemir/Documents/ap_articles/data/siim-acr"
   vindr:
-      root_dir: "/path/to/your/datasets"
+      root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/train"  # VinDr train DICOMs (E5); images not downloaded yet
   ptx498:
       root_dir: "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix"
   model:
