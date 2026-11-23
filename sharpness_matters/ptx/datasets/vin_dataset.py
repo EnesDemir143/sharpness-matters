@@ -24,7 +24,7 @@ HOME = Path(__file__).resolve().parent.parent
 class VinDataset(Dataset):
     def __init__(
         self,
-        root_dir: str = cfg.ptx.vin_dr.root_dir,
+        root_dir: str = cfg.ptx["vindr"]["root_dir"],
         img_size: int = 224,
         transform=None,
         stats_dir=f"{HOME}/output/cache/vin_stats.pkl",

@@ -29,6 +29,12 @@ dependencies = [
     "ptflops==0.7.3",
     "python-gdcm==3.0.25",
     "seaborn",
+    "torch==2.1.0",
+    "torchvision==0.16.0",
+    "scikit-learn",
+    "colorlog",
+    "PyYAML",
+    "click",
 ]
 
 [project.optional-dependencies]

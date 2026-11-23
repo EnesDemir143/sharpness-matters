@@ -6,7 +6,7 @@ ptx:
   ptx498:
       root_dir: "/path/to/your/datasets"
   model:
-      checkpoint_dir: "/path/to/your/checkpoints"  # Where to save model checkpoints
+      checkpoint_dir: "/path/to/your/ptx_checkpoints"  # Where to save model checkpoints
       tuned_checkpoint_dir: "/path/to/your/checkpoints"  # Optional, you only need this if you want to compare cross validation with standard parameters vs tuned parameters
 pneumonia:
   rsna_pneumonia:
@@ -14,5 +14,5 @@ pneumonia:
   siim_covid:
       root_dir: "/path/to/your/datasets"
   model:
-      checkpoint_dir: "/path/to/your/checkpoints"  # Where to save model checkpoints
+      checkpoint_dir: "/path/to/your/pneumonia_checkpoints"  # Where to save model checkpoints
       tuned_checkpoint_dir: "/path/to/your/checkpoints"  # Optional, you only need this if you want to compare cross validation with standard parameters vs tuned parameters

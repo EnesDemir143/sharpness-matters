@@ -3,6 +3,7 @@ Utility file for evaluation of classification performance
 """
 
 import os
+import hashlib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -15,7 +16,15 @@ from typing import Dict, List, Tuple, Union, Type
 from sharpness_matters.config.load_config import cfg
 
 HOME = Path(__file__).resolve().parent.parent
-CHECKPOINT_DIR = cfg.pneumonia.model.checkpoint_dir
+CHECKPOINT_DIR = cfg.ptx.model.checkpoint_dir
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def auroc_confidence_interval(
@@ -176,6 +185,9 @@ def eval_res(
             continue
         # Evaluate this fold
         model = model_class.load_from_checkpoint(checkpoint_path)
+        logger.info(
+            f"Fold {fold}: checkpoint={checkpoint_path} sha256={_sha256(checkpoint_path)}"
+        )
         model.eval()
         model.to("cuda" if torch.cuda.is_available() else "cpu")
         fold_results = evaluate_fold(fold, val_loader, model)
