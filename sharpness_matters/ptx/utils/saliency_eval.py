@@ -18,6 +18,7 @@ from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, List, Union, Optional, Any
+from sklearn.metrics import average_precision_score
 import matplotlib.pyplot as plt
 
 from sharpness_matters.config.load_config import cfg
@@ -42,7 +43,7 @@ RULE_DESCRIPTIONS = {
         "threshold without renormalisation; sensitivity analysis only"
     ),
 }
-SCORE_COLUMNS = [
+LEGACY_SCORE_COLUMNS = [
     "image_id",
     "prob",
     "decision",
@@ -52,6 +53,11 @@ SCORE_COLUMNS = [
     "coverage",
     "empty_pred_mask",
 ]
+# B (protocol §4.4 E3/E4 XAI metrics): hit rate + pixel-AUPRC for the main rule,
+# threshold-free and computed once per image; both are repeated on every threshold row of
+# the main CSV so the schema stays byte-identical across datasets (E3 PTX-498, E4
+# CheXlocalize) and the legacy CSV keeps LEGACY_SCORE_COLUMNS unchanged.
+SCORE_COLUMNS = LEGACY_SCORE_COLUMNS + ["hit", "pixel_auprc"]
 NEGATIVE_SCORE_COLUMNS = [
     "image_id",
     "prob",
@@ -526,6 +532,40 @@ def _iou(ground_truth: np.ndarray, prediction: np.ndarray) -> float:
     return float(np.logical_and(gt, pred).sum()) / union
 
 
+def hit_indicator(saliency: np.ndarray, ground_truth: np.ndarray) -> float:
+    """1.0 if the peak of the normalised map lies on GT foreground, else 0.0.
+
+    B (protocol §4.4 E3/E4 XAI metrics): current -> E3/E4 report only thresholded IoU /
+    precision, which depend on `saliency_thresholds`; new -> the threshold-free hit rate
+    of the main rule is recorded per image. `np.argmax` returns the first maximum in
+    row-major order, so ties resolve deterministically to the first peak. A contrast-free
+    map was min-maxed to `constant_image_value`; all its pixels tie and index 0 is the
+    defined peak (the predicted mask is empty there anyway).
+    check: tests/corrected/test_saliency.py::test_hit_is_first_argmax_inside_gt
+    """
+    foreground = np.asarray(ground_truth) > 0
+    peak = int(np.argmax(np.asarray(saliency, dtype=np.float32).ravel()))
+    return float(bool(foreground.ravel()[peak]))
+
+
+def pixel_average_precision(saliency: np.ndarray, ground_truth: np.ndarray) -> float:
+    """Pixel-level average precision of the normalised map against binarised GT.
+
+    B (protocol §4.4 E3/E4 XAI metrics): pixel-AUPRC is valid in score space, so it is
+    threshold-free: `sklearn.metrics.average_precision_score(gt.ravel(), map.ravel())` over
+    the GT grid. A constant map scores every pixel equally, and AP of a single
+    operating point equals its precision, i.e. the GT prevalence. An empty GT has no
+    positive pixel (AP undefined, sklearn warns and returns 0); the masked-scoring path
+    raises before that (§7.4), and the explicit 0.0 keeps this helper warning-free.
+    check: tests/corrected/test_saliency.py::test_pixel_auprc_perfect_random_and_constant
+    """
+    foreground = (np.asarray(ground_truth) > 0).ravel().astype(np.uint8)
+    if not foreground.any():
+        return 0.0
+    scores = np.asarray(saliency, dtype=np.float64).ravel()
+    return float(average_precision_score(foreground, scores))
+
+
 def score_fold_saliency(
     fold_saliency: List[np.ndarray],
     ground_truth: np.ndarray,
@@ -539,7 +579,9 @@ def score_fold_saliency(
     author's mean -> threshold is returned separately as `legacy`. A constant map has no
     contrast, so min-max maps it to `cfg.ptx.corrected.constant_image_value` and the
     predicted mask is empty. `>= threshold` counts a pixel exactly at the threshold as
-    selected, the same convention as `calculate_precision`.
+    selected, the same convention as `calculate_precision`. The two threshold-free
+    metrics of the main rule (`hit`, `pixel_auprc`) are computed once here and reused on
+    every threshold row by the caller.
     check: tests/corrected/test_saliency.py::test_fold_mean_renormalisation_rescues_high_threshold
     """
     gt = np.asarray(ground_truth)
@@ -551,6 +593,9 @@ def score_fold_saliency(
     gt_binary = gt > 0
     ensemble = ensemble_fold_saliency(fold_saliency, gt.shape)
     normalized = minmax_per_image(ensemble)
+    # B (protocol §4.4 E3/E4 XAI metrics): threshold-free, once per image.
+    hit = hit_indicator(normalized, gt_binary)
+    pixel_auprc = pixel_average_precision(normalized, gt_binary)
     scores: Dict[str, Dict[float, Dict[str, Any]]] = {RULE_MAIN: {}, RULE_LEGACY: {}}
     for rule, saliency in ((RULE_MAIN, normalized), (RULE_LEGACY, ensemble)):
         for threshold in thresholds:
@@ -567,6 +612,8 @@ def score_fold_saliency(
     return {
         "ensemble_saliency": ensemble,
         "normalized_saliency": normalized,
+        "hit": hit,
+        "pixel_auprc": pixel_auprc,
         "scores": scores,
     }
 
@@ -630,6 +677,14 @@ def _mean_std(values: List[float]) -> Tuple[float, float]:
     return float(array.mean()), float(array.std())
 
 
+def _mean_if_present(rows: List[Dict[str, Any]], key: str) -> float:
+    """Mean of a column that only the main rule carries; absent -> NaN (JSON null)."""
+    values = [row[key] for row in rows if key in row]
+    if not values:
+        return float("nan")
+    return float(np.mean(np.asarray(values, dtype=np.float64)))
+
+
 def summarize_scores(
     rows: List[Dict[str, Any]], thresholds: List[float]
 ) -> Dict[str, Any]:
@@ -639,7 +694,10 @@ def summarize_scores(
     `all_positive` (K1, every GT-positive image, decision independent),
     `tp_conditional` (positive decision only) and `joint` (K1 denominator, a wrong
     negative contributes 0; coverage keeps its own positive-decision denominator because
-    the author records no coverage for a wrong negative).
+    the author records no coverage for a wrong negative). The threshold-free `hit` and
+    `pixel_auprc` of the main rule (protocol §4.4 E3/E4) use the same three denominators;
+    in `joint` a wrong negative contributes 0 for both, exactly like IoU / precision.
+    The legacy rule has no such columns, so their means come out NaN (JSON null).
     """
     summaries: Dict[str, Any] = {}
     for threshold in thresholds:
@@ -660,6 +718,26 @@ def summarize_scores(
         joint_precision_mean, joint_precision_std = _mean_std(
             [row["precision"] if row["decision"] == 1 else 0.0 for row in subset]
         )
+        hit_mean = _mean_if_present(subset, "hit")
+        pixel_auprc_mean = _mean_if_present(subset, "pixel_auprc")
+        tp_hit_mean = _mean_if_present(positive, "hit")
+        tp_pixel_auprc_mean = _mean_if_present(positive, "pixel_auprc")
+        joint_hit_mean = _mean_if_present(
+            [
+                {"hit": row["hit"] if row["decision"] == 1 else 0.0}
+                for row in subset
+                if "hit" in row
+            ],
+            "hit",
+        )
+        joint_pixel_auprc_mean = _mean_if_present(
+            [
+                {"pixel_auprc": row["pixel_auprc"] if row["decision"] == 1 else 0.0}
+                for row in subset
+                if "pixel_auprc" in row
+            ],
+            "pixel_auprc",
+        )
         empty = sum(1 for row in subset if int(row["empty_pred_mask"]) == 1)
         summaries[f"{threshold:g}"] = {
             "threshold": threshold,
@@ -671,6 +749,8 @@ def summarize_scores(
                 "precision_std": precision_std,
                 "coverage_mean": coverage_mean,
                 "coverage_n": len(subset),
+                "hit_mean": hit_mean,
+                "pixel_auprc_mean": pixel_auprc_mean,
             },
             "tp_conditional": {
                 "n": len(positive),
@@ -680,6 +760,8 @@ def summarize_scores(
                 "precision_std": tp_precision_std,
                 "coverage_mean": tp_coverage_mean,
                 "coverage_n": len(positive),
+                "hit_mean": tp_hit_mean,
+                "pixel_auprc_mean": tp_pixel_auprc_mean,
             },
             "joint": {
                 "n": len(subset),
@@ -689,6 +771,8 @@ def summarize_scores(
                 "precision_std": joint_precision_std,
                 "coverage_mean": tp_coverage_mean,
                 "coverage_n": len(positive),
+                "hit_mean": joint_hit_mean,
+                "pixel_auprc_mean": joint_pixel_auprc_mean,
             },
             "empty_pred_mask": {
                 "n": len(subset),
@@ -743,6 +827,8 @@ def compute_scores_chunked(
     Returns:
         Dict[str, Dict[str, Any]]: one result per rule (`main`, `legacy`) with per-image
         `rows`, `negative_rows` (coverage only), the K1 `positive_ids` and `summaries`.
+        Main rows additionally carry the threshold-free `hit` and `pixel_auprc`
+        (protocol §4.4 E3/E4); legacy rows keep the author's columns unchanged.
     """
     k_folds = int(cfg.ptx.corrected.k_folds)
     if thresholds is None:
@@ -829,18 +915,22 @@ def compute_scores_chunked(
                 for rule in (RULE_MAIN, RULE_LEGACY):
                     for threshold in thresholds:
                         metric = scored["scores"][rule][float(threshold)]
-                        rows[rule].append(
-                            {
-                                "image_id": image_id,
-                                "prob": prob,
-                                "decision": decision,
-                                "threshold": float(threshold),
-                                "iou": metric["iou"],
-                                "precision": metric["precision"],
-                                "coverage": metric["coverage"],
-                                "empty_pred_mask": int(metric["empty_pred_mask"]),
-                            }
-                        )
+                        row = {
+                            "image_id": image_id,
+                            "prob": prob,
+                            "decision": decision,
+                            "threshold": float(threshold),
+                            "iou": metric["iou"],
+                            "precision": metric["precision"],
+                            "coverage": metric["coverage"],
+                            "empty_pred_mask": int(metric["empty_pred_mask"]),
+                        }
+                        if rule == RULE_MAIN:
+                            # B (protocol §4.4 E3/E4 XAI metrics): threshold-free, the
+                            # same value is repeated on every threshold row of this image.
+                            row["hit"] = scored["hit"]
+                            row["pixel_auprc"] = scored["pixel_auprc"]
+                        rows[rule].append(row)
                 if save_maps:
                     _save_map_visualisations(
                         item,
@@ -929,15 +1019,19 @@ def write_saliency_outputs(
 
     B (PTX-04 / §7.4): the CSV is keyed by ImageId and carries `prob`, `decision`,
     `threshold`, `iou`, `precision`, `coverage` and `empty_pred_mask`; the JSON keeps the
-    K1 / TP-conditional / joint denominators. The K1 key set is asserted to be exactly the
-    GT-positive ImageId set, so a dropped image cannot pass as a normal result.
+    K1 / TP-conditional / joint denominators. The main CSV additionally carries the
+    threshold-free `hit` and `pixel_auprc` (protocol §4.4 E3/E4), repeated on every
+    threshold row; the legacy CSV keeps `LEGACY_SCORE_COLUMNS` unchanged. The K1 key set
+    is asserted to be exactly the GT-positive ImageId set, so a dropped image cannot
+    pass as a normal result.
     check: tests/corrected/test_saliency.py::test_k1_key_set_equals_positive_image_ids
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     written: Dict[str, Dict[str, str]] = {}
     for rule, result in results.items():
-        frame = pd.DataFrame(result["rows"], columns=SCORE_COLUMNS)
+        columns = SCORE_COLUMNS if rule == RULE_MAIN else LEGACY_SCORE_COLUMNS
+        frame = pd.DataFrame(result["rows"], columns=columns)
         positive_ids = set(result["positive_ids"])
         if set(frame["image_id"]) != positive_ids:
             raise RuntimeError(
@@ -994,6 +1088,8 @@ def summary_table(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "precision_std": entry["precision_std"],
                     "coverage_mean": entry["coverage_mean"],
                     "coverage_n": entry["coverage_n"],
+                    "hit_mean": entry.get("hit_mean"),
+                    "pixel_auprc_mean": entry.get("pixel_auprc_mean"),
                     "empty_count": summary["empty_pred_mask"]["n_empty"],
                     "empty_fraction": summary["empty_pred_mask"]["fraction"],
                     "tau": result["tau"],

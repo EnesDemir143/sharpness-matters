@@ -24,6 +24,7 @@ import torch
 
 from sharpness_matters.config.load_config import cfg
 from sharpness_matters.ptx.utils.saliency_eval import (
+    LEGACY_SCORE_COLUMNS,
     NEGATIVE_SCORE_COLUMNS,
     RULE_LEGACY,
     RULE_MAIN,
@@ -32,6 +33,8 @@ from sharpness_matters.ptx.utils.saliency_eval import (
     compute_scores_chunked,
     create_cache_dir,
     fold_chunk_paths,
+    hit_indicator,
+    pixel_average_precision,
     save_fold_chunk,
     score_fold_saliency,
     write_saliency_outputs,
@@ -571,3 +574,158 @@ def test_collate_keeps_masks_as_a_list():
     assert collated["data"].shape == (2, 1, 8, 8)
     assert isinstance(collated["mask"], list)
     assert [mask.shape for mask in collated["mask"]] == [(32, 32), (40, 40)]
+
+
+def _single_peak(size: int, row: int, col: int) -> np.ndarray:
+    """Zero map with one 1.0 peak; used at the GT grid so no resize is involved."""
+    peak = np.zeros((size, size), dtype=np.float32)
+    peak[row, col] = 1.0
+    return peak
+
+
+def test_hit_is_first_argmax_inside_gt():
+    """Protocol §4.4 E3/E4: hit = 1 iff the normalised peak lies on GT, ties -> first."""
+    gt_inside = np.zeros((8, 8), dtype=np.uint8)
+    gt_inside[2, 3] = 1
+    inside = [_single_peak(8, 2, 3) for _ in range(K_FOLDS)]
+
+    result = score_fold_saliency(inside, gt_inside, [0.5])
+
+    assert result["hit"] == 1.0
+    assert result["scores"][RULE_MAIN][0.5]["iou"] == 1.0
+
+    outside = [_single_peak(8, 5, 5) for _ in range(K_FOLDS)]
+    assert score_fold_saliency(outside, gt_inside, [0.5])["hit"] == 0.0
+
+    # Two equal maxima: row-major first argmax at (1, 1); (4, 4) is only a later tie.
+    tied = _single_peak(8, 1, 1)
+    tied[4, 4] = 1.0
+    gt_second_tie = np.zeros((8, 8), dtype=np.uint8)
+    gt_second_tie[4, 4] = 1
+    gt_first_tie = np.zeros((8, 8), dtype=np.uint8)
+    gt_first_tie[1, 1] = 1
+
+    assert hit_indicator(tied, gt_second_tie) == 0.0
+    assert hit_indicator(tied, gt_first_tie) == 1.0
+    tied_folds = [tied.copy() for _ in range(K_FOLDS)]
+    assert score_fold_saliency(tied_folds, gt_second_tie, [0.5])["hit"] == 0.0
+    assert score_fold_saliency(tied_folds, gt_first_tie, [0.5])["hit"] == 1.0
+
+    # A contrast-free map was min-maxed to one value: every pixel ties and index 0 is the
+    # documented peak, so hit is 1 only when GT covers pixel (0, 0).
+    constant = [np.full((8, 8), 0.4, dtype=np.float32) for _ in range(K_FOLDS)]
+    gt_origin = np.zeros((8, 8), dtype=np.uint8)
+    gt_origin[0, 0] = 1
+    assert score_fold_saliency(constant, gt_origin, [0.5])["hit"] == 1.0
+    assert score_fold_saliency(constant, gt_inside, [0.5])["hit"] == 0.0
+
+
+def test_pixel_auprc_perfect_random_and_constant():
+    """Protocol §4.4 E3/E4: pixel-AUPRC is threshold-free; sklearn AP on the GT grid."""
+    gt = np.zeros((128, 128), dtype=np.uint8)
+    gt[:64, :64] = 1
+    prevalence = float(gt.mean())
+    assert prevalence == 0.25
+
+    # A perfect ranking recovers every GT pixel first: AP = 1.
+    assert pixel_average_precision(gt.astype(np.float32), gt) == pytest.approx(1.0)
+    assert pixel_average_precision(gt.astype(np.float32) * 255.0, gt) == pytest.approx(
+        1.0
+    )
+
+    # Random scores carry no localisation: AP sits at the prevalence.
+    random_map = np.random.default_rng(0).random(gt.shape).astype(np.float32)
+    assert pixel_average_precision(random_map, gt) == pytest.approx(
+        prevalence, abs=0.02
+    )
+
+    # Constant scores have a single operating point: AP equals its precision, i.e. the
+    # GT prevalence, for any constant value.
+    for value in (0.0, 0.3, 255.0):
+        constant = np.full(gt.shape, value, dtype=np.float32)
+        assert pixel_average_precision(constant, gt) == pytest.approx(
+            prevalence, abs=1e-12
+        )
+
+    # The main rule's min-max maps a contrast-free CAM to `constant_image_value`, so the
+    # recorded pixel_auprc is the prevalence of the reference grid.
+    fold_maps = [np.full((16, 16), 0.4, dtype=np.float32) for _ in range(K_FOLDS)]
+    result = score_fold_saliency(fold_maps, gt, [0.25, 0.5, 0.75])
+    assert result["pixel_auprc"] == pytest.approx(prevalence, abs=1e-12)
+
+    # Empty GT never reaches this path (PTX-04 raises first); the helper is defined as 0.
+    assert pixel_average_precision(random_map, np.zeros_like(gt)) == 0.0
+
+
+def test_hit_and_pixel_auprc_denominators(tmp_path):
+    """Protocol §4.4 E3/E4: K1 / tp_conditional / joint denominators, joint FN -> 0."""
+    gt_fn = np.zeros((32, 32), dtype=np.uint8)
+    gt_fn[8:20, 8:20] = 1
+    gt_tp = np.zeros((32, 32), dtype=np.uint8)
+    gt_tp[4:12, 4:12] = 1
+    items = [_item("fn1", 1, gt_fn), _item("tp1", 1, gt_tp)]
+    probs = {"fn1": 0.2, "tp1": 0.9}
+    cams = {
+        "fn1": [_hot_cam(16, 6 + fold, 6 + fold) for fold in range(K_FOLDS)],
+        "tp1": [_hot_cam(16, 2 + fold, 2 + fold) for fold in range(K_FOLDS)],
+    }
+    record = _record(tau=0.5)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    _write_run(cache_dir, items, probs, cams, record)
+
+    results = _scores(cache_dir, _MaskedDataset(items), record)
+    thresholds = [float(t) for t in cfg.ptx.corrected.saliency_thresholds]
+    main_rows = {
+        (row["image_id"], row["threshold"]): row
+        for row in results[RULE_MAIN]["rows"]
+    }
+    legacy_row = results[RULE_LEGACY]["rows"][0]
+    assert "hit" not in legacy_row and "pixel_auprc" not in legacy_row
+
+    # Threshold-free: one value per image, repeated on every threshold row.
+    for image_id in ("fn1", "tp1"):
+        values = {
+            (main_rows[(image_id, t)]["hit"], main_rows[(image_id, t)]["pixel_auprc"])
+            for t in thresholds
+        }
+        assert len(values) == 1
+
+    fn1 = main_rows[("fn1", thresholds[0])]
+    tp1 = main_rows[("tp1", thresholds[0])]
+    assert fn1["decision"] == 0 and tp1["decision"] == 1
+    assert 0.0 <= fn1["hit"] <= 1.0 and 0.0 <= fn1["pixel_auprc"] <= 1.0
+
+    summary = results[RULE_MAIN]["summaries"][f"{thresholds[0]:g}"]
+    assert summary["all_positive"]["n"] == 2
+    assert summary["all_positive"]["hit_mean"] == pytest.approx(
+        (fn1["hit"] + tp1["hit"]) / 2
+    )
+    assert summary["all_positive"]["pixel_auprc_mean"] == pytest.approx(
+        (fn1["pixel_auprc"] + tp1["pixel_auprc"]) / 2
+    )
+    # tp_conditional: only the positive decision, so the wrong negative is excluded.
+    assert summary["tp_conditional"]["hit_mean"] == pytest.approx(tp1["hit"])
+    assert summary["tp_conditional"]["pixel_auprc_mean"] == pytest.approx(
+        tp1["pixel_auprc"]
+    )
+    # joint: K1 denominator, the wrong negative contributes 0 like IoU / precision.
+    assert summary["joint"]["hit_mean"] == pytest.approx(tp1["hit"] / 2)
+    assert summary["joint"]["pixel_auprc_mean"] == pytest.approx(tp1["pixel_auprc"] / 2)
+
+    written = write_saliency_outputs(results, tmp_path / "out", "synthetic", "resnet", 64)
+    main_frame = pd.read_csv(written[RULE_MAIN]["csv"], dtype={"image_id": str})
+    assert list(main_frame.columns) == SCORE_COLUMNS
+    stored = main_frame[
+        (main_frame["image_id"] == "tp1") & (main_frame["threshold"] == thresholds[0])
+    ]
+    assert float(stored["hit"].iloc[0]) == pytest.approx(tp1["hit"])
+    assert float(stored["pixel_auprc"].iloc[0]) == pytest.approx(tp1["pixel_auprc"])
+    legacy_frame = pd.read_csv(written[RULE_LEGACY]["csv"], dtype={"image_id": str})
+    assert list(legacy_frame.columns) == LEGACY_SCORE_COLUMNS
+    # Legacy has no threshold-free columns, so its JSON reports them as null.
+    legacy_summary = json.loads(Path(written[RULE_LEGACY]["summary"]).read_text())
+    assert legacy_summary["summaries"]["0.5"]["all_positive"]["hit_mean"] is None
+    assert (
+        legacy_summary["summaries"]["0.5"]["all_positive"]["pixel_auprc_mean"] is None
+    )

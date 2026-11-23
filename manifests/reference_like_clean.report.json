@@ -1,0 +1,26 @@
+{
+  "annotations_csv": "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/annotations/annotations_train.csv",
+  "checks": {
+    "count_complete": true,
+    "disjoint_from_pos": true,
+    "unique": true
+  },
+  "complete": true,
+  "filled": 4,
+  "generated_utc": "2026-11-23T19:32:17.902796+00:00",
+  "loaded_from_frozen": true,
+  "manifest": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/manifests/reference_like_clean.csv",
+  "manifest_sha256": "76273c552e4fa5cb3b713fafb8302d4513c0439ee2f6a8bed98e36533c06652b",
+  "n_dup": 4,
+  "n_neg": 594,
+  "n_pos": 96,
+  "neg_clean": 594,
+  "neg_list": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/manifests/reference_like/vin500neg.txt",
+  "pool_size": 14314,
+  "pos": 96,
+  "pos_list": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/manifests/reference_like/vin500pos.txt",
+  "reference_counts_match_expected": true,
+  "seed": 42,
+  "shortfall": 0,
+  "target_neg": 594
+}

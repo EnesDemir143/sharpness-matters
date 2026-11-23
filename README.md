@@ -137,6 +137,12 @@ uv run python -m sharpness_matters.ptx.corrected.make_e5 clean
 uv run python -m sharpness_matters.ptx.corrected.e5_multidraw --base-seed 0 --draws 20 --hashseeds 0,1,2
 ```
 
+**5b. E2 and E4 manifests:** VinDr-CXR v1.0.0 official test (PhysioNet `image_labels_test.csv` + `test/*.dicom`) → `manifests/vindr_test.csv`; CheXlocalize (CheXpert val/test images + label CSVs + `gt_segmentations_*.json`) → `manifests/chexlocalize_cls.csv`, `manifests/chexlocalize_xai.csv`.
+```bash
+uv run python -m sharpness_matters.ptx.corrected.make_vindr_test
+uv run python -m sharpness_matters.ptx.corrected.make_chexlocalize
+```
+
 All manifests are frozen with `.sha256` + `.record.json`; an existing manifest is loaded, never rebuilt, and a hash mismatch stops the run. Commit `manifests/` after this step.
 
 **6. (Optional) demographics over unique image IDs:**
@@ -156,12 +162,15 @@ uv run python -m sharpness_matters.ptx.train.train_kfold --model_name resnet
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode holdout
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode ood_reference_like --e5_manifest manifests/reference_like_combined.csv
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode ood_clean --e5_manifest manifests/reference_like_clean.csv
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_test     # E2
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode chexlocalize   # E4 classification
 ```
 
 **9. Saliency evaluation (GT kept on its reference grid; decision-independent K1 cohort):**
 ```bash
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_saliency       # SIIM internal test
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_saliency_ood   # PTX-498
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_saliency_chexlocalize   # E4 XAI
 ```
 
 **10. Statistics (pre-registered, hash-locked plan):** copy `sharpness_matters/ptx/corrected/analysis_plan.example.json`, fill in the inputs, lock it before looking at results, then run.

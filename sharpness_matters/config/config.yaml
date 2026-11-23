@@ -2,13 +2,18 @@ ptx:
   siim_acr:
     root_dir: "/Users/enesdemir/Documents/ap_articles/data/siim-acr"
   vindr:
-      root_dir: "/path/to/your/datasets"
+      root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/train"  # E5: VinDr train DICOMs (<image_id>.dicom); images not downloaded yet
+      test_root_dir: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/test"  # E2: PhysioNet VinDr-CXR official test DICOMs (3,000); images not downloaded yet
+      test_labels_csv: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/annotations/image_labels_test.csv"  # E2: 5-radiologist consensus image labels
+  chexlocalize:  # E4 (complementary external classification + XAI)
+      annotations_dir: "/Users/enesdemir/Documents/ap_articles/data/CheXlocalize_files"  # gt_segmentations_{val,test}.json
+      chexpert_dir: "/path/to/CheXlocalize/CheXpert"  # val/, test/, val_labels.csv, test_labels.csv (Stanford AIMI CheXlocalize download)
   ptx498:
       root_dir: "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix"
   model:
       checkpoint_dir: "/Users/enesdemir/Documents/ap_articles/runs/checkpoints/ptx_stage2"  # Where to save model checkpoints
       tuned_checkpoint_dir: "/path/to/your/checkpoints"  # Optional, you only need this if you want to compare cross validation with standard parameters vs tuned parameters
-  vindr_annotations_csv: "/path/to/your/datasets/vindr/train.csv"  # Annotation CSV fed to the author's create_vin_dr_subset.py (E5)
+  vindr_annotations_csv: "/Users/enesdemir/Documents/ap_articles/data/vindr-cxr/annotations/annotations_train.csv"  # PhysioNet v1.0.0 train annotations fed to the author's create_vin_dr_subset.py (E5); uses image_id + class_name only
   corrected:  # Stage 2 (B) settings; every value not changed by a correction item is the author's value (baseline_correction.md §11)
       manifest_dir: "manifests"  # Relative to the repository root
       k_folds: 5

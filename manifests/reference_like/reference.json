@@ -1,0 +1,17 @@
+{
+  "combined_csv": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/manifests/reference_like_combined.csv",
+  "combined_csv_sha256": "01efb768b19739af730f000da42bc42a742edf90af86d582c7e035b2c70fd784",
+  "counts_match_expected": true,
+  "expected_neg_count": 594,
+  "expected_pos_count": 96,
+  "generated_utc": "2026-11-23T19:32:11.734380+00:00",
+  "loaded_from_frozen": false,
+  "n_combined_rows": 690,
+  "n_dup": 4,
+  "n_neg": 594,
+  "n_pos": 96,
+  "n_unique_ids": 686,
+  "neg_list_sha256": "dfe86dc43580da3b2f22c7bbd7f6d39b6f1eb0793a0d24a17a3d026fa2a57708",
+  "pos_list_sha256": "2ff97b281533c86450b789f76aab89427b6a901091fe2e7f56f991b07eabd4f7",
+  "reference_dir": "/Users/enesdemir/Documents/ap_articles/ref-source-code/sharpness-matters/manifests/reference_like"
+}

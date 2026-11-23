@@ -16,11 +16,24 @@ predictions are saved keyed by ImageId for further analysis.
 #   `p_value_classification.py` reads them (`oodpred_*`, `holdoutpred_*`, `*gt.npy`);
 #   that script is not part of B, but keeping the files avoids breaking a reader on the
 #   branch. E5-clean has no legacy name, so it gets its own `ood_clean` prefix.
+# B (§4.4 E2 / E4): current -> the evaluator knew only the internal holdout and the two
+#   E5 VinDr+PTX-498 runs, so the protocol's external rows had no prediction file.
+#   New -> `vindr_test` evaluates the VinDr official test manifest (E2) and
+#   `chexlocalize` evaluates the CheXlocalize classification manifest (E4); both keep
+#   the ID-keyed CSV and the run's own tau, `source` is `vindr_test` /
+#   `chexlocalize_<split>`, and the E4 CSV additionally keeps `split` and
+#   `patient_id`. E2 needs no `--e5_manifest` (its ids come from the frozen E2
+#   manifest).
+#   check: tests/corrected/test_e2_e4_eval.py::test_vindr_test_mode_writes_id_csv,
+#   ::test_chexlocalize_mode_keeps_split_and_patient_id,
+#   ::test_cli_help_lists_e2_e4_modes
 
 Usage:
     Run this module directly:
         python3 evaluate_kfold.py --validation_mode=<validation_dataset>
         python3 evaluate_kfold.py --validation_mode=ood_clean --e5_manifest=manifests/reference_like_clean.csv
+        python3 evaluate_kfold.py --validation_mode=vindr_test   # E2
+        python3 evaluate_kfold.py --validation_mode=chexlocalize  # E4
     Output CSV files with evaluation metrics for each model will be saved in
     'classification_{model_name}_{validation_mode}.csv'.
 """
@@ -43,6 +56,7 @@ from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
 from sharpness_matters.ptx.datasets.vin_dataset import VinDataset
 from sharpness_matters.ptx.datasets.ptx498_dataset import OODTestDataset
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
+from sharpness_matters.ptx.corrected.frozen import manifest_dir
 from sharpness_matters.ptx.utils.classification_eval import eval_res
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
 from sharpness_matters.config.load_config import cfg
@@ -51,6 +65,18 @@ logger = initialize_logger(level="debug")
 DATA_DIR = cfg.ptx.siim_acr.root_dir
 HOME = Path(__file__).resolve().parent.parent
 logger.debug(f"Output Root: {HOME}")
+
+# Manifest names live in their builders (make_vindr_test / make_chexlocalize); the
+# evaluator only reads the frozen csv, so the names are mirrored here (§4.4 E2/E4).
+VINDR_TEST_MANIFEST = "vindr_test.csv"
+CHEXLOCALIZE_CLS_MANIFEST = "chexlocalize_cls.csv"
+VALIDATION_MODES = (
+    "holdout",
+    "ood_reference_like",
+    "ood_clean",
+    "vindr_test",
+    "chexlocalize",
+)
 
 
 def _legacy_npy_prefix(validation_mode: str) -> str:
@@ -66,6 +92,34 @@ def _legacy_npy_prefix(validation_mode: str) -> str:
     return validation_mode
 
 
+def _chexlocalize_cohort_columns(
+    manifest_csv: Path, ids: list
+) -> Dict[str, list]:
+    """Align the frozen E4 classification manifest's split/patient_id to dataset order.
+
+    The dataset keeps manifest order (`image_ids`), so the metadata columns are read
+    straight from the same manifest and checked against that order; a reordered or
+    duplicated cohort raises instead of mislabelling a prediction row.
+    """
+    manifest = pd.read_csv(
+        manifest_csv, dtype={"image_id": str, "split": str, "patient_id": str}
+    )
+    missing = {"image_id", "split", "patient_id"} - set(manifest.columns)
+    if missing:
+        raise KeyError(f"{manifest_csv} is missing columns {sorted(missing)}")
+    manifest_ids = [str(image_id) for image_id in manifest["image_id"]]
+    if manifest_ids != list(ids):
+        raise RuntimeError(
+            f"CheXlocalize manifest order mismatch: {manifest_csv} lists ids that "
+            "differ from the dataset's image_ids, so split/patient_id cannot be "
+            "attached to the prediction rows"
+        )
+    return {
+        "split": [str(split) for split in manifest["split"]],
+        "patient_id": [str(patient_id) for patient_id in manifest["patient_id"]],
+    }
+
+
 def fetch_results_per_resolution(
     img_size: int = 512,
     model_name: str = "resnet",
@@ -78,13 +132,17 @@ def fetch_results_per_resolution(
     Args:
         img_size (int): Input image size for model evaluation
         model_name (str): Model architecture ('resnet' or 'densenet')
-        validation_mode (str): Validation dataset ('holdout', 'ood_reference_like' or
-            'ood_clean'); the E5 variants are separate runs with separate manifests.
-        e5_manifest (str): ID+label manifest of the E5 run (required for the E5 modes)
+        validation_mode (str): Validation dataset ('holdout', 'ood_reference_like',
+            'ood_clean', 'vindr_test' or 'chexlocalize'); the E5 variants are separate
+            runs with separate manifests, E2/E4 read their own frozen manifests.
+        e5_manifest (str): ID+label manifest of the E5 run (required for the E5 modes;
+            unused by E2/E4, whose cohorts come from their frozen manifests)
 
     Returns:
         Dict[str, Any]: Dictionary containing evaluation metrics
     """
+    # Extra ID-keyed columns beyond `source`; the E4 CSV keeps split and patient_id.
+    extra_columns: Dict[str, list] = {}
     # Extract training files required to initialize dataset
     if validation_mode == "holdout":
         train_dicom_dir = os.path.join(DATA_DIR, "dicom-images-train")
@@ -110,9 +168,39 @@ def fetch_results_per_resolution(
         expected = [int(vin_ds.labels[i]) for i in vin_ds.image_ids] + [1] * len(
             ptx_ds.image_ids
         )
+    elif validation_mode == "vindr_test":
+        # B (§4.4 E2): official test split only; no PTX-498 images are mixed in, so the
+        # positives and negatives come from the same validated VinDr cohort.
+        manifest_csv = manifest_dir() / VINDR_TEST_MANIFEST
+        dataset = VinDataset(
+            manifest_csv=str(manifest_csv),
+            root_dir=str(cfg.ptx.vindr.test_root_dir),
+            img_size=img_size,
+        )
+        ids = list(dataset.image_ids)
+        sources = ["vindr_test"] * len(ids)
+        expected = [int(dataset.labels[i]) for i in ids]
+    elif validation_mode == "chexlocalize":
+        # B (§4.4 E4): complementary external cohort; split and patient_id are kept so
+        # the report can count val/test/combined separately and watch clustering.
+        from sharpness_matters.ptx.datasets.chexlocalize_dataset import (
+            CheXlocalizeDataset,
+        )
+
+        manifest_csv = manifest_dir() / CHEXLOCALIZE_CLS_MANIFEST
+        dataset = CheXlocalizeDataset(str(manifest_csv), img_size)
+        ids = list(dataset.image_ids)
+        expected = [int(dataset.labels[i]) for i in ids]
+        cohort = _chexlocalize_cohort_columns(manifest_csv, ids)
+        extra_columns = {
+            "split": cohort["split"],
+            "patient_id": cohort["patient_id"],
+        }
+        sources = [f"chexlocalize_{split}" for split in cohort["split"]]
     else:
         raise ValueError(
-            "Invalid validation mode: Choose one of holdout, ood_reference_like, ood_clean"
+            "Invalid validation mode: Choose one of "
+            + ", ".join(VALIDATION_MODES)
         )
     # Compute evaluation metrics for given resolution; predictions are ID-keyed
     pred_df, ensemble_metrics = eval_res(
@@ -151,6 +239,8 @@ def fetch_results_per_resolution(
     np.save(out_dir / f"{prefix}gt.npy", pred_df["label"].to_numpy().astype(int))
     # Section 6.4: ID-keyed predictions (score = fold-mean sigmoid probability)
     pred_df.insert(1, "source", sources)
+    for column, values in extra_columns.items():
+        pred_df[column] = values
     pred_df.to_csv(
         out_dir / f"{validation_mode}pred_{model_name}_{img_size}_ids.csv",
         index=False,
@@ -161,9 +251,10 @@ def fetch_results_per_resolution(
 @click.command()
 @click.option(
     "--validation_mode",
-    type=click.Choice(["holdout", "ood_reference_like", "ood_clean"]),
+    type=click.Choice(list(VALIDATION_MODES)),
     required=True,
-    help="Choose validation dataset: One of holdout, ood_reference_like, ood_clean",
+    help="Choose validation dataset: holdout, ood_reference_like, ood_clean "
+    "(internal holdout and the two E5 runs) or vindr_test, chexlocalize (E2, E4)",
 )
 @click.option(
     "--e5_manifest",
@@ -176,8 +267,8 @@ def main(validation_mode: str, e5_manifest: str) -> None:
     Main function to run the evaluation for the baseline resolution.
 
     Args:
-        validation_mode (str): Validation dataset ('holdout', 'ood_reference_like'
-            or 'ood_clean')
+        validation_mode (str): Validation dataset ('holdout', 'ood_reference_like',
+            'ood_clean', 'vindr_test' or 'chexlocalize')
         e5_manifest (str): E5 manifest path (required for the E5 modes)
     """
     if validation_mode.startswith("ood") and not e5_manifest:
