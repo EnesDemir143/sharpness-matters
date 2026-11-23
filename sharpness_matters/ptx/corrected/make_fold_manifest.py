@@ -119,3 +119,13 @@ def load_fold_manifest() -> pd.DataFrame:
     frame["label"] = frame["label"].astype(int)
     frame["fold"] = frame["fold"].astype(int)
     return frame
+
+
+if __name__ == "__main__":
+    # Build-and-freeze (first run) or load-and-verify (later runs) manifests/siim_folds.csv.
+    folds = load_fold_manifest()
+    print(
+        f"siim_folds.csv: {len(folds)} images, {int(folds['label'].sum())} positive; "
+        f"per fold (n, positives): "
+        f"{folds.groupby('fold')['label'].agg(['size', 'sum']).values.tolist()}"
+    )

@@ -29,27 +29,34 @@ Training deep learning chest radiograph classifiers at higher resolutions result
 
 ## Installation
 
+> **Branch `stage2-corrected`:** corrected baseline-CV (B) of the PTX pipeline. The environment is pinned in `uv.lock`; `pyproject.toml` is the single source and `requirements.txt` is exported from the lock.
+
 ### Prerequisites
--  Python 3.8.10
-- CUDA-compatible GPU (recommended)
+- [uv](https://docs.astral.sh/uv/) (tested with 0.7.3)
+- Python 3.8.x (`~=3.8.10`; uv installs 3.8.20 if missing)
+- CUDA or Apple MPS GPU recommended for training
 
 ### Quick Start
 
-1. **Clone the repository**
-    ```bash
-    git clone https://github.com/your-username/sharpness_matters.git
-    cd sharpness_matters
-    ```
+```bash
+git clone https://github.com/EnesDemir143/sharpness-matters.git
+cd sharpness-matters
+git switch stage2-corrected
 
-2. **Create conda environment and install**
-    ```bash
-    conda create -n sharpness_matters python=3.8.10
-    conda activate sharpness_matters
-    pip install -e .
-    
-    # For development (optional)
-    pip install -e .[dev]
-    ```
+uv python install 3.8.20
+uv sync --python 3.8.20              # creates .venv from uv.lock (torch 2.1.0, torchvision 0.16.0)
+uv sync --python 3.8.20 --extra dev  # optional: pytest for the test suite
+```
+
+Run every command below from the repository root with `uv run` (or `source .venv/bin/activate` and drop `uv run`).
+
+`pip install -r requirements.txt` installs the same pinned versions but uv is the supported path.
+
+### Tests (synthetic data only, no downloads)
+
+```bash
+uv run python -m pytest -q tests/corrected
+```
 
 ## Datasets Used
 
@@ -82,96 +89,88 @@ This project uses five public datasets:
 
 ## Prepare Config File
 
-1. **Download datasets** from their respective sources (Kaggle competitions, etc.)
+Edit `sharpness_matters/config/config.yaml`:
 
-2. **Update configuration**: Edit the dataset paths and checkpoint settings in `sharpness_matters/config/config.yaml`:
-    ```yaml
-    # Dataset paths - Update all paths below to match your local dataset directories
-        ptx:
-          siim_acr:
-            root_dir: "/path/to/your/datasets"
-            vindr:
-                root_dir: "/path/to/your/datasets"
-            ptx498:
-                root_dir: "/path/to/your/datasets"
-        pneumonia:
-          rsna_pneumonia:
-            root_dir: "/path/to/your/datasets"
-            siim_covid:
-                root_dir: "/path/to/your/datasets"
-    
-    # Model checkpoint settings
-    model:
-        checkpoint_dir: "/path/to/your/checkpoints"  # Where to save model checkpoints
-        tuned_checkpoint_dir: "/path/to/your/checkpoints"  # Optional, you only need this if you want to compare cross validation with standard parameters vs tuned parameters
-    ```
-
-## Usage
-
-Before running any commands, navigate to the appropriate task directory:
-
-```bash
-# For pneumothorax experiments
-cd sharpness_matters/ptx
-
-# For pneumonia experiments  
-cd sharpness_matters/pneumonia
+```yaml
+ptx:
+  siim_acr:
+    root_dir: "/data/siim-acr"            # contains dicom-images-train/ and train-rle.csv
+  vindr:
+      root_dir: "/data/vindr/train"       # <image_id>.dicom files
+  ptx498:
+      root_dir: "/data/ptx498"            # SiteA/ SiteB/ SiteC/ NIfTI files
+  model:
+      checkpoint_dir: "/data/checkpoints/ptx"
+  vindr_annotations_csv: "/data/vindr/train.csv"
+  corrected:                              # B settings; keep the author values (baseline_correction.md §11)
+      ...
 ```
 
-### Basic Training
+The `ptx.corrected` block holds the pinned B settings (folds, epochs, patience, LR, batch size, resize policy, OOF target sensitivity, E5 seeds). Do not edit it for a B run.
 
-**Train pneumothorax classifier:**
+## Usage — corrected baseline (B), in order
+
+Steps 1–6 need no training. Step 7 trains and downloads ImageNet weights.
+
+**1. Pre-run data checks (read-only):** writes `reports/data_checks_<date>.md/.json` and orientation overlays. Every check ends as `ISSUE`, `NO CHANGE NEEDED` or `OPEN`; resolve `ISSUE`/`OPEN` before continuing.
 ```bash
-python train/train_kfold.py --model_name densenet
+uv run python -m sharpness_matters.ptx.corrected.data_checks --out reports/
 ```
 
-**Train pneumonia classifier:**
+**2. SIIM fold manifest:** builds and freezes `manifests/siim_folds.csv` (StratifiedKFold, 5 folds, seed 42) or verifies it if it already exists.
 ```bash
-python train/train_kfold.py --model_name resnet
+uv run python -m sharpness_matters.ptx.corrected.make_fold_manifest
 ```
 
-### Hyperparameter Optimization (Optional Ablation)
-
+**3. Reference-like E5:** runs the unmodified author script `create_vin_dr_subset.py` once (fixed `PYTHONHASHSEED`) and freezes `manifests/reference_like_combined.csv`, both lists and `N_dup`.
 ```bash
-python train/train_sweep.py
+uv run python -m sharpness_matters.ptx.corrected.make_e5 reference
 ```
 
-### Evaluation
-
-**Classification performance:**
+**4. E5-clean:** derived from the frozen lists (positives removed from negatives, refilled to 594) → `manifests/reference_like_clean.csv`.
 ```bash
-python evaluation/evaluate_kfold.py --validation_mode holdout
-
-# If using ptx (vindr) else skip the next line
-python dataset/create_vin_dr_subset.py
-
-python evaluation/evaluate_kfold.py --validation_mode ood
+uv run python -m sharpness_matters.ptx.corrected.make_e5 clean
 ```
 
-**Saliency map evaluation:**
+**5. Multi-draw sensitivity record (optional record, never an E5 input):**
 ```bash
-# Internal test set
-python evaluation/evaluate_saliency.py
-
-# External test set
-python evaluation/evaluate_saliency_ood.py
+uv run python -m sharpness_matters.ptx.corrected.e5_multidraw --base-seed 0 --draws 20 --hashseeds 0,1,2
 ```
 
-### Statistical Analysis
+All manifests are frozen with `.sha256` + `.record.json`; an existing manifest is loaded, never rebuilt, and a hash mismatch stops the run. Commit `manifests/` after this step.
 
+**6. (Optional) demographics over unique image IDs:**
 ```bash
-# Classification performance significance testing
-python evaluation/p_value_classification.py --dataset holdout --model_name densenet
-
-# Saliency map quality significance testing  
-python evaluation/p_value_saliency.py --dataset external --model_name resnet
+uv run python sharpness_matters/ptx/datasets/extract_demographics.py --dataset siim_acr
+uv run python sharpness_matters/ptx/datasets/extract_demographics.py --dataset vindr --vindr-manifest manifests/reference_like_clean.csv
 ```
 
-### Performance Benchmarking
-
+**7. Training (512² only, 5 folds):** writes per-fold best (min `val/loss`) checkpoints, `cv_record.json` (checkpoint hashes, best epochs, fold AUROC, `S(h)`, OOF threshold τ) and `oof_predictions.csv` under `checkpoint_dir`.
 ```bash
-python evaluation/computational_usage.py --model_name densenet
+uv run python -m sharpness_matters.ptx.train.train_kfold --model_name densenet
+uv run python -m sharpness_matters.ptx.train.train_kfold --model_name resnet
 ```
+
+**8. Classification evaluation (ID-keyed predictions, decision `p >= τ`):**
+```bash
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode holdout
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode ood_reference_like --e5_manifest manifests/reference_like_combined.csv
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode ood_clean --e5_manifest manifests/reference_like_clean.csv
+```
+
+**9. Saliency evaluation (GT kept on its reference grid; decision-independent K1 cohort):**
+```bash
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_saliency       # SIIM internal test
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_saliency_ood   # PTX-498
+```
+
+**10. Statistics (pre-registered, hash-locked plan):** copy `sharpness_matters/ptx/corrected/analysis_plan.example.json`, fill in the inputs, lock it before looking at results, then run.
+```bash
+uv run python -m sharpness_matters.ptx.corrected.analysis lock plans/analysis_plan.json
+uv run python -m sharpness_matters.ptx.corrected.analysis run plans/analysis_plan.json --out-dir reports/analysis
+```
+
+The author's `p_value_classification.py`, `p_value_saliency.py`, `train_sweep.py` and `compare_cv_tune.py` are not part of B.
 
 ## Citation
 

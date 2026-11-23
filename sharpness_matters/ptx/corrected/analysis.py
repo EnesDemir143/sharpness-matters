@@ -1178,3 +1178,20 @@ def run_plan(path: Path, out_dir: Path) -> Dict[str, Any]:
         "plan_sha256": digest,
         "outputs": outputs,
     }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Pre-registered analysis plan (Section 8).")
+    sub = parser.add_subparsers(dest="command", required=True)
+    lock_cmd = sub.add_parser("lock", help="validate the plan and write <plan>.sha256")
+    lock_cmd.add_argument("plan", type=Path)
+    run_cmd = sub.add_parser("run", help="run a locked plan")
+    run_cmd.add_argument("plan", type=Path)
+    run_cmd.add_argument("--out-dir", type=Path, required=True)
+    args = parser.parse_args()
+    if args.command == "lock":
+        print(lock_plan(args.plan))
+    else:
+        print(json.dumps(run_plan(args.plan, args.out_dir), indent=2))
