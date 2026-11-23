@@ -180,7 +180,7 @@ if __name__ == "__main__":
     for threshold in thresholds:
         for model_name in model_names:
             out = []
-            for img_size in [64, 128, 224, 512, 768, 1024]:
+            for img_size in [512]:  # Stage 1 run scope: run A is 512 only (protocol §6); author list 64..1024
                 torch.cuda.empty_cache()
                 dataset = OODTestDataset(img_size=img_size)
                 logger.info(

@@ -141,7 +141,7 @@ def main(validation_mode: str) -> None:
     model_names = ["resnet", "densenet"]
     for model_name in model_names:
         out = []
-        for img_size in [64, 128, 224, 512, 768, 1024]:
+        for img_size in [512]:  # Stage 1 run scope: run A is 512 only (protocol §6); author list 64..1024
             res = fetch_results_per_resolution(img_size, model_name, validation_mode)
             res["img_size"] = img_size
             out.append(res)

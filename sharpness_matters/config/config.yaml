@@ -1,12 +1,12 @@
 ptx:
   siim_acr:
-    root_dir: "/path/to/your/datasets"
+    root_dir: "/Users/enesdemir/Documents/ap_articles/data/siim-acr"
   vindr:
       root_dir: "/path/to/your/datasets"
   ptx498:
-      root_dir: "/path/to/your/datasets"
+      root_dir: "/Users/enesdemir/Documents/ap_articles/data/PTX-498-v2-fix"
   model:
-      checkpoint_dir: "/path/to/your/ptx_checkpoints"  # Where to save model checkpoints
+      checkpoint_dir: "/Users/enesdemir/Documents/ap_articles/runs/checkpoints/ptx_stage1"  # Where to save model checkpoints
       tuned_checkpoint_dir: "/path/to/your/checkpoints"  # Optional, you only need this if you want to compare cross validation with standard parameters vs tuned parameters
 pneumonia:
   rsna_pneumonia:

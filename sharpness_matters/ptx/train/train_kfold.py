@@ -142,7 +142,7 @@ def main(model_name):
     batch_size = 8
     lr = 1e-4
     num_epochs = 20
-    for img_size in [64, 128, 224, 512, 768, 1024]:
+    for img_size in [512]:  # Stage 1 run scope: run A is 512 only (protocol §6); author list 64..1024
         train_transforms = transforms.Compose(
             [
                 transforms.ToTensor(),
