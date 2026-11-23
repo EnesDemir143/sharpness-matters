@@ -37,6 +37,7 @@ from sharpness_matters.ptx.corrected.frozen import (
     hash_path,
     load_or_create_frozen,
     manifest_dir,
+    record_path,
     repo_root,
     sha256_file,
 )
@@ -231,19 +232,110 @@ def _verify_frame(path: Path, frame: pd.DataFrame, expected: pd.DataFrame) -> No
         )
 
 
+def reference_combined_csv() -> Path:
+    return manifest_dir() / REFERENCE_COMBINED_NAME
+
+
+def clean_manifest_csv() -> Path:
+    return manifest_dir() / CLEAN_NAME
+
+
+def _frozen_artifacts_exist(path: Path) -> bool:
+    """True when any of csv/.sha256/.record.json exists (load-first trigger)."""
+    return any(p.exists() for p in (path, hash_path(path), record_path(path)))
+
+
+def _load_frozen_only(path: Path) -> pd.DataFrame:
+    """Load an existing frozen manifest; never build one (Section 4.2 load-first)."""
+
+    def _refuse_build():  # pragma: no cover - only reached for a broken frozen state
+        raise RuntimeError(
+            f"{path} is not frozen (csv/.sha256/.record.json missing); this path only "
+            "loads an existing freeze"
+        )
+
+    return load_or_create_frozen(path, _refuse_build, {})
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _reference_report_from_frame(
+    frame: pd.DataFrame, ref_dir: Path, combined_csv: Path
+) -> Dict[str, object]:
+    """Report the frozen reference manifest without re-deriving it from the lists."""
+    required = {"image_id", "label", "source_list"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise RuntimeError(
+            f"Frozen reference manifest {combined_csv} lacks columns {sorted(missing)}"
+        )
+    image_ids = frame["image_id"].astype(str)
+    source = frame["source_list"].astype(str)
+    n_neg = int((source == "neg").sum())
+    n_pos = int((source == "pos").sum())
+    report = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "loaded_from_frozen": True,
+        "reference_dir": str(ref_dir),
+        "combined_csv": str(combined_csv),
+        "combined_csv_sha256": sha256_file(combined_csv),
+        "n_neg": n_neg,
+        "n_pos": n_pos,
+        "n_combined_rows": int(len(frame)),
+        "n_unique_ids": int(image_ids.nunique()),
+        "n_dup": int(len(frame) - image_ids.nunique()),
+        "expected_neg_count": EXPECTED_NEG_COUNT,
+        "expected_pos_count": EXPECTED_POS_COUNT,
+        "counts_match_expected": (
+            n_neg == EXPECTED_NEG_COUNT and n_pos == EXPECTED_POS_COUNT
+        ),
+    }
+    for name, txt in (
+        ("neg_list_sha256", ref_dir / AUTHOR_NEG_LIST),
+        ("pos_list_sha256", ref_dir / AUTHOR_POS_LIST),
+    ):
+        recorded = hash_path(txt)
+        report[name] = (
+            recorded.read_text(encoding="utf-8").split()[0]
+            if recorded.exists()
+            else None
+        )
+    return report
+
+
 def freeze_reference_lists(
     neg_txt: Path,
     pos_txt: Path,
     ref_dir: Path = None,
     combined_csv: Path = None,
 ) -> Dict[str, object]:
-    """Freeze the two author lists and write the combined reference-like manifest."""
+    """Load the frozen reference manifest if present, else freeze the two author lists.
+
+    Section 4.2 (load-if-exists): a frozen ``reference_like_combined.csv`` is read
+    back before anything is recomputed; the author lists are only parsed when the
+    manifest does not exist yet.
+    """
     ref_dir = Path(ref_dir) if ref_dir is not None else reference_dir()
     combined_csv = (
-        Path(combined_csv)
-        if combined_csv is not None
-        else manifest_dir() / REFERENCE_COMBINED_NAME
+        Path(combined_csv) if combined_csv is not None else reference_combined_csv()
     )
+
+    if _frozen_artifacts_exist(combined_csv):
+        # Integrity of the raw evidence only; the report is derived from the frozen
+        # csv, never from re-parsing the lists or re-running the author script.
+        _verify_frozen_txt_copies(ref_dir)
+        report = _reference_report_from_frame(
+            _load_frozen_only(combined_csv), ref_dir, combined_csv
+        )
+        write_json(ref_dir / REFERENCE_REPORT_NAME, report)
+        return report
+
     frozen_neg = ref_dir / AUTHOR_NEG_LIST
     frozen_pos = ref_dir / AUTHOR_POS_LIST
     _copy_or_verify(Path(neg_txt), frozen_neg)
@@ -273,6 +365,7 @@ def freeze_reference_lists(
 
     report = {
         "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "loaded_from_frozen": False,
         "reference_dir": str(ref_dir),
         "combined_csv": str(combined_csv),
         "neg_list_sha256": sha256_file(frozen_neg),
@@ -289,16 +382,17 @@ def freeze_reference_lists(
             len(neg) == EXPECTED_NEG_COUNT and len(pos) == EXPECTED_POS_COUNT
         ),
     }
-    report_path = ref_dir / REFERENCE_REPORT_NAME
-    report_path.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    write_json(ref_dir / REFERENCE_REPORT_NAME, report)
     return report
 
 
 def run_reference_e5() -> Dict[str, object]:
-    """Run the author selector once (if not frozen yet) and freeze both lists."""
+    """Load the frozen reference manifest, or freeze it; run the author once only."""
     ref_dir = reference_dir()
+    if _frozen_artifacts_exist(reference_combined_csv()):
+        return freeze_reference_lists(
+            ref_dir / AUTHOR_NEG_LIST, ref_dir / AUTHOR_POS_LIST
+        )
     if _verify_frozen_txt_copies(ref_dir):
         return freeze_reference_lists(
             ref_dir / AUTHOR_NEG_LIST, ref_dir / AUTHOR_POS_LIST
@@ -353,14 +447,20 @@ def _normalized_rule(text: str) -> str:
     return "".join(str(text).split()).replace('"', "'")
 
 
-def candidate_negative_ids(annotations_csv: Path) -> List[str]:
-    """Negative candidate pool: image IDs of rows with ``class_name != Pneumothorax``."""
+def verify_negative_rule() -> str:
+    """Raise unless cfg.ptx.corrected.e5.negative_rule is the rule implemented here."""
     rule = str(cfg.ptx.corrected.e5.negative_rule)
     if _normalized_rule(rule) != _normalized_rule(NEGATIVE_RULE):
         raise RuntimeError(
             f"cfg.ptx.corrected.e5.negative_rule is {rule!r} but this module implements "
-            f"{NEGATIVE_RULE!r}; change candidate_negative_ids together with the config"
+            f"{NEGATIVE_RULE!r}; change the code together with the config"
         )
+    return NEGATIVE_RULE
+
+
+def candidate_negative_ids(annotations_csv: Path) -> List[str]:
+    """Negative candidate pool: image IDs of rows with ``class_name != Pneumothorax``."""
+    verify_negative_rule()
     frame = pd.read_csv(annotations_csv)
     missing = {"image_id", "class_name"} - set(frame.columns)
     if missing:
@@ -442,35 +542,104 @@ def _clean_manifest_frame(neg_clean: Sequence[str], pos: Sequence[str]) -> pd.Da
     return pd.DataFrame(rows, columns=["image_id", "label"])
 
 
+def _split_reference_lists(
+    combined: pd.DataFrame,
+) -> Tuple[List[str], List[str]]:
+    """Recover the frozen NEG and POS lists (author order) from the combined manifest."""
+    required = {"image_id", "label", "source_list"}
+    missing = required - set(combined.columns)
+    if missing:
+        raise RuntimeError(
+            f"Frozen reference manifest lacks columns {sorted(missing)}; run the "
+            "`reference` subcommand to rebuild it from the author lists"
+        )
+    source = combined["source_list"].astype(str)
+    image_ids = combined["image_id"].astype(str)
+    neg = image_ids[source == "neg"].tolist()
+    pos = image_ids[source == "pos"].tolist()
+    return neg, pos
+
+
+def _clean_report_from_frame(frame: pd.DataFrame, path: Path) -> Dict[str, object]:
+    """Report the frozen E5-clean manifest without re-deriving or sampling it."""
+    missing = {"image_id", "label"} - set(frame.columns)
+    if missing:
+        raise RuntimeError(f"Frozen clean manifest {path} lacks columns {sorted(missing)}")
+    labels = frame["label"].astype(int)
+    image_ids = frame["image_id"].astype(str)
+    neg_ids = image_ids[labels == 0].tolist()
+    pos_ids = image_ids[labels == 1].tolist()
+    report: Dict[str, object] = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "loaded_from_frozen": True,
+        "manifest": str(path),
+        "manifest_sha256": sha256_file(path),
+        "neg_list": str(reference_dir() / AUTHOR_NEG_LIST),
+        "pos_list": str(reference_dir() / AUTHOR_POS_LIST),
+        "n_neg": len(neg_ids),
+        "neg_clean": len(neg_ids),
+        "n_pos": len(pos_ids),
+        "pos": len(pos_ids),
+        "checks": {
+            "disjoint_from_pos": not (set(neg_ids) & set(pos_ids)),
+            "unique": len(set(neg_ids)) == len(neg_ids),
+        },
+    }
+    recorded = record_path(path)
+    if recorded.exists():
+        data = json.loads(recorded.read_text(encoding="utf-8"))
+        for key in (
+            "seed",
+            "n_dup",
+            "pool_size",
+            "filled",
+            "shortfall",
+            "complete",
+            "target_neg",
+            "annotations_csv",
+            "reference_counts_match_expected",
+        ):
+            if key in data:
+                report[key] = data[key]
+        if "target_neg" in data:
+            report["checks"]["count_complete"] = len(neg_ids) == int(data["target_neg"])
+    return report
+
+
 def run_clean_e5(seed: int = None) -> Dict[str, object]:
-    """Write (or verify) ``manifests/reference_like_clean.csv`` and its report."""
+    """Load the frozen clean manifest if present, else derive and freeze it.
+
+    Section 4.2 (load-if-exists): ``reference_like_clean.csv`` + ``.sha256`` are
+    checked first; when they match, the manifest is returned without reading the
+    annotation CSV and without drawing anything. Only the absent-manifest path
+    reads the candidate pool and calls ``build_e5_clean``.
+    """
+    path = clean_manifest_csv()
+    if _frozen_artifacts_exist(path):
+        report = _clean_report_from_frame(_load_frozen_only(path), path)
+        write_json(path.parent / CLEAN_REPORT_NAME, report)
+        return report
+
     seed = (
         int(cfg.ptx.corrected.e5.clean_fill_seed) if seed is None else int(seed)
     )
-    ref_dir = reference_dir()
-    neg_txt = ref_dir / AUTHOR_NEG_LIST
-    pos_txt = ref_dir / AUTHOR_POS_LIST
-    for path in (neg_txt, pos_txt):
-        if not path.exists():
-            raise RuntimeError(
-                f"Frozen list {path} is missing; run the `reference` subcommand first"
-            )
-        _verify_sha256(path)
-    neg_frozen = parse_txt_list(neg_txt)
-    pos = parse_txt_list(pos_txt)
+    combined_csv = reference_combined_csv()
+    if not _frozen_artifacts_exist(combined_csv):
+        raise RuntimeError(
+            f"Frozen reference manifest {combined_csv} is missing; run the "
+            "`reference` subcommand first (E5-clean is derived from it)"
+        )
+    neg_frozen, pos = _split_reference_lists(_load_frozen_only(combined_csv))
 
     annotations_csv = Path(str(cfg.ptx.vindr_annotations_csv))
     candidates = candidate_negative_ids(annotations_csv)
     neg_clean, report = build_e5_clean(neg_frozen, pos, candidates, seed)
     expected = _clean_manifest_frame(neg_clean, pos)
 
-    path = manifest_dir() / CLEAN_NAME
     record = {
         "item": "PTX-03/PTX-08 E5-clean negative manifest",
-        "derived_from": str(neg_txt),
-        "derived_from_sha256": sha256_file(neg_txt),
-        "pos_list": str(pos_txt),
-        "pos_list_sha256": sha256_file(pos_txt),
+        "derived_from": str(combined_csv),
+        "derived_from_sha256": sha256_file(combined_csv),
         "annotations_csv": str(annotations_csv),
         "annotations_csv_sha256": sha256_file(annotations_csv),
         "negative_rule": NEGATIVE_RULE,
@@ -481,8 +650,12 @@ def run_clean_e5(seed: int = None) -> Dict[str, object]:
         "filled": report["filled"],
         "shortfall": report["shortfall"],
         "complete": report["complete"],
+        "target_neg": report["target_neg"],
         "n_neg": len(neg_clean),
         "n_pos": len(pos),
+        "reference_counts_match_expected": (
+            len(neg_frozen) == EXPECTED_NEG_COUNT and len(pos) == EXPECTED_POS_COUNT
+        ),
     }
     frame = load_or_create_frozen(path, lambda: expected, record)
     _verify_frame(path, frame, expected)
@@ -491,10 +664,13 @@ def run_clean_e5(seed: int = None) -> Dict[str, object]:
     report.update(
         {
             "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "loaded_from_frozen": False,
             "manifest": str(path),
             "manifest_sha256": sha256_file(path),
-            "neg_list": str(neg_txt),
-            "pos_list": str(pos_txt),
+            "n_neg": len(neg_clean),
+            "n_pos": len(pos),
+            "neg_list": str(reference_dir() / AUTHOR_NEG_LIST),
+            "pos_list": str(reference_dir() / AUTHOR_POS_LIST),
             "annotations_csv": str(annotations_csv),
             "reference_counts_match_expected": (
                 len(neg_frozen) == EXPECTED_NEG_COUNT
@@ -502,11 +678,7 @@ def run_clean_e5(seed: int = None) -> Dict[str, object]:
             ),
         }
     )
-    report_path = path.parent / CLEAN_REPORT_NAME
-    report_path.write_text(
-        json.dumps(report, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    write_json(path.parent / CLEAN_REPORT_NAME, report)
     return report
 
 

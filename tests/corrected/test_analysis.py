@@ -520,3 +520,24 @@ def test_delong_identical_predictions_is_explicit(tmp_path):
     assert frame["p_bh"].iloc[0] == 1.0
     assert not bool(frame["reject"].iloc[0])
     assert payload["comparisons"][0]["delong_degenerate"] is True
+
+
+def test_delong_zero_variance_with_nonzero_difference_raises():
+    # Installed MLstatkit returns (-inf, 0.0) here: AUROC_A=1, AUROC_B=0, zero variance.
+    # That is not a p=1 result; inference is undefined and must raise.
+    labels = np.array([0, 0, 1, 1])
+    prob_a = np.array([0.1, 0.2, 0.8, 0.9])
+    prob_b = np.array([0.9, 0.8, 0.2, 0.1])
+    with pytest.raises(ValueError, match="variance is zero with a nonzero AUROC difference"):
+        delong_paired(labels, prob_a, prob_b)
+
+
+def test_delong_normal_case_is_unchanged():
+    rng = np.random.default_rng(17)
+    labels = np.array([0, 1] * 25)
+    prob_a = np.clip(0.5 + 0.15 * labels + rng.normal(0, 0.10, labels.size), 0.01, 0.99)
+    prob_b = np.clip(0.5 + 0.35 * labels + rng.normal(0, 0.10, labels.size), 0.01, 0.99)
+    statistic, p_value, degenerate = delong_paired(labels, prob_a, prob_b)
+    assert degenerate is False
+    assert np.isfinite(statistic) and statistic > 0.0
+    assert 0.0 < p_value < 1.0

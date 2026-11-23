@@ -372,12 +372,14 @@ def check_photometric(
             unreadable.append({"file": path.name, "error": f"{type(exc).__name__}: {exc}"})
             continue
         value = header.get("PhotometricInterpretation", None)
-        label = str(value) if value is not None else "MISSING"
-        counts[label] += 1
-        if label == "MONOCHROME1":
-            monochrome1.append(path.stem)
-        elif label == "MISSING":
+        label = str(value).strip() if value is not None else ""
+        if not label:
+            # Absent or zero-length: the polarity is unknown, never assumed.
+            label = "MISSING"
             missing.append(path.stem)
+        elif label == "MONOCHROME1":
+            monochrome1.append(path.stem)
+        counts[label] += 1
 
     data = dict(base)
     data.update(
@@ -652,6 +654,11 @@ def check_vindr_bit_depth(root: Path, samples_per_group: int = 5) -> Dict[str, A
             )
 
     compressed = {_is_compressed(slot["meta"]["TransferSyntax"]) for slot in groups.values()}
+    n_sampled = n_equal + n_differing + n_failed
+    unreadable_examples = [row["file"] for row in unreadable[:5]]
+    failed_examples = [
+        row["file"] for row in samples if row.get("error") is not None
+    ][:5]
     data = dict(base)
     data.update(
         {
@@ -659,7 +666,7 @@ def check_vindr_bit_depth(root: Path, samples_per_group: int = 5) -> Dict[str, A
             "distribution": distribution,
             "n_unreadable": len(unreadable),
             "unreadable_files": unreadable[:10],
-            "n_sampled": n_equal + n_differing + n_failed,
+            "n_sampled": n_sampled,
             "n_equal": n_equal,
             "n_differing": n_differing,
             "n_failed": n_failed,
@@ -669,7 +676,7 @@ def check_vindr_bit_depth(root: Path, samples_per_group: int = 5) -> Dict[str, A
         }
     )
     summary = [
-        f"metadata groups: {len(groups)}; sampled files: {n_equal + n_differing + n_failed}",
+        f"metadata groups: {len(groups)}; sampled files: {n_sampled}",
         f"pixel-identical: {n_equal}; differing: {n_differing}; failed: {n_failed}",
         "groups: "
         + "; ".join(
@@ -679,13 +686,44 @@ def check_vindr_bit_depth(root: Path, samples_per_group: int = 5) -> Dict[str, A
         ),
     ]
     if unreadable:
-        summary.append(f"unreadable headers: {len(unreadable)}")
+        summary.append(
+            f"unreadable headers: {len(unreadable)} (e.g. {unreadable_examples})"
+        )
     if n_failed:
-        summary.append(f"{n_failed} sampled file(s) could not be decoded")
+        summary.append(
+            f"{n_failed} sampled file(s) could not be decoded (e.g. {failed_examples})"
+        )
+    if n_sampled == 0:
+        summary.append(
+            f"nothing was compared: 0 of {len(files)} DICOM file(s) yielded a pixel array"
+        )
         return _result(
             "9.3b",
             VINDR_BITS_TITLE,
-            status_open(f"reason: {n_failed} sampled file(s) could not be decoded"),
+            status_open(
+                f"reason: 0 of {len(files)} DICOM file(s) could be decoded, so no pixel "
+                "comparison was possible"
+            ),
+            summary,
+            data,
+        )
+    if unreadable or n_failed:
+        problems = []
+        if unreadable:
+            problems.append(f"{len(unreadable)} unreadable header(s)")
+        if n_failed:
+            problems.append(f"{n_failed} decode failure(s)")
+        summary.append(
+            f"only {n_sampled} of {len(files)} file(s) were compared; equality on the "
+            "readable subset is not evidence for the whole dataset"
+        )
+        return _result(
+            "9.3b",
+            VINDR_BITS_TITLE,
+            status_open(
+                f"reason: {' and '.join(problems)} among {len(files)} file(s); only "
+                f"{n_sampled} file(s) were compared"
+            ),
             summary,
             data,
         )
@@ -699,7 +737,7 @@ def check_vindr_bit_depth(root: Path, samples_per_group: int = 5) -> Dict[str, A
             VINDR_BITS_TITLE,
             status_open(
                 f"reason: forced and unmodified decode differ on {n_differing} of "
-                f"{n_equal + n_differing} sampled file(s); which decode is correct "
+                f"{n_sampled} sampled file(s); which decode is correct "
                 "requires human review"
             ),
             summary,
@@ -1170,7 +1208,12 @@ def _empty_ptx498_masks(root: Path) -> Dict[str, Any]:
         try:
             data = _nifti_array(path)
         except Exception as exc:
-            unreadable.append({"file": path.name, "error": f"{type(exc).__name__}: {exc}"})
+            unreadable.append(
+                {
+                    "file": f"{path.parent.name}/{path.name}",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             continue
         if not bool(np.any(data > 0)):
             empty.append(f"{path.parent.name}/{path.name.split('.')[0]}")
@@ -1204,12 +1247,25 @@ def _empty_siim_positives(root: Path) -> Dict[str, Any]:
         encodings.setdefault(image_id, []).append(str(encoded))
     positives = [image_id for image_id in image_ids if labels[image_id] == 1]
     empty: List[str] = []
+    malformed: List[Dict[str, Any]] = []
     for image_id in tqdm(positives, desc="GT-EMPTY SIIM", leave=False):
         has_foreground = False
         for encoded in encodings.get(image_id, []):
             if encoded.strip() == "-1":
                 continue
-            if bool(np.any(_rle_decode(encoded) > 0)):
+            try:
+                decoded = _rle_decode(encoded)
+            except Exception as exc:
+                # A mask that cannot be decoded is neither empty nor verified.
+                malformed.append(
+                    {
+                        "image_id": str(image_id),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                has_foreground = True
+                break
+            if bool(np.any(decoded > 0)):
                 has_foreground = True
                 break
         if not has_foreground:
@@ -1222,6 +1278,8 @@ def _empty_siim_positives(root: Path) -> Dict[str, Any]:
         "n_empty": len(empty),
         "empty_ids": empty[:500],
         "empty_ids_truncated": max(0, len(empty) - 500),
+        "n_malformed": len(malformed),
+        "malformed_masks": malformed[:10],
     }
 
 
@@ -1285,8 +1343,21 @@ def check_empty_gt_masks(
             f"SIIM example ids: {blocks['siim']['empty_ids'][:5] or 'none'}"
         )
     unreadable = int(blocks["ptx498"].get("n_unreadable", 0))
+    malformed = int(blocks["siim"].get("n_malformed", 0))
+    zero_evaluated: List[str] = []
+    if blocks["ptx498"].get("available") and int(blocks["ptx498"].get("n_masks", 0)) == 0:
+        zero_evaluated.append("ptx498: 0 mask file")
+    if (
+        blocks["siim"].get("available")
+        and int(blocks["siim"].get("n_positive_ids", 0)) == 0
+    ):
+        zero_evaluated.append("siim: 0 positive ImageId in train-rle.csv")
     if unreadable:
         summary.append(f"unreadable PTX-498 masks: {unreadable}")
+    if malformed:
+        summary.append(f"malformed SIIM masks: {malformed}")
+    if zero_evaluated:
+        summary.append("nothing to evaluate: " + "; ".join(zero_evaluated))
 
     if empty_total:
         return _result(
@@ -1308,11 +1379,21 @@ def check_empty_gt_masks(
             summary,
             data,
         )
-    if unreadable:
+    if zero_evaluated or malformed or unreadable:
+        reasons: List[str] = []
+        if zero_evaluated:
+            reasons.append("; ".join(zero_evaluated))
+        if malformed:
+            reasons.append(f"{malformed} malformed SIIM mask(s)")
+        if unreadable:
+            reasons.append(f"{unreadable} unreadable PTX-498 mask(s)")
+        summary.append(
+            "a clean count of 0 empty masks cannot be claimed from this state"
+        )
         return _result(
             "GT-EMPTY",
             EMPTY_GT_TITLE,
-            status_open(f"reason: {unreadable} PTX-498 mask(s) could not be read"),
+            status_open("reason: " + "; ".join(reasons)),
             summary,
             data,
         )

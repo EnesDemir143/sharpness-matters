@@ -6,6 +6,7 @@ exact SIIM ImageId -> file map and the masked loaders' native-grid masks.
 No real data, no author-script run, no training.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from sharpness_matters.ptx.corrected.preprocess import (
 )
 from sharpness_matters.ptx.corrected.make_fold_manifest import build_fold_manifest
 from sharpness_matters.ptx.corrected import make_e5
+from sharpness_matters.ptx.corrected import e5_multidraw
 from sharpness_matters.ptx.datasets import siim_acr_classification_dataset as siim_cls
 from sharpness_matters.ptx.datasets import siim_acr_dataset as siim_masked
 from sharpness_matters.ptx.datasets import ptx498_dataset as ptx498
@@ -462,6 +464,220 @@ def test_e5_candidate_pool_uses_class_name_rule(tmp_path):
     ).to_csv(annotations, index=False)
     candidates = make_e5.candidate_negative_ids(annotations)
     assert candidates == ["n1", "n2"]  # POS ids are not excluded here (E5-clean does that)
+
+
+# ------------------------------------------------------- manifest load-first
+
+
+def _fake_annotations_csv(path: Path, rows) -> Path:
+    pd.DataFrame(rows, columns=["image_id", "class_name"]).to_csv(path, index=False)
+    return path
+
+
+def _no_derivation(monkeypatch):
+    """Make every derivation step of the clean manifest fail loudly if reached."""
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("load-first path re-derived the manifest")
+
+    class _NoRandom:
+        @staticmethod
+        def Random(*args, **kwargs):
+            raise AssertionError("load-first path sampled")
+
+    monkeypatch.setattr(make_e5, "candidate_negative_ids", _explode)
+    monkeypatch.setattr(make_e5, "build_e5_clean", _explode)
+    monkeypatch.setattr(make_e5, "random", _NoRandom)
+
+
+def test_e5_clean_load_first_skips_csv_and_sampling(tmp_path, monkeypatch):
+    manifests = tmp_path / "manifests"
+    monkeypatch.setattr(make_e5, "manifest_dir", lambda: manifests)
+    annotations = _fake_annotations_csv(
+        tmp_path / "train.csv",
+        [
+            ("p1", "Pneumothorax"),
+            ("n1", "Aortic enlargement"),
+            ("n2", "Cardiomegaly"),
+        ],
+    )
+    monkeypatch.setattr(cfg.ptx, "vindr_annotations_csv", str(annotations))
+    neg_txt, pos_txt = _fake_txt_pair(tmp_path, ["n1", "n2"], ["p1"])
+    make_e5.freeze_reference_lists(neg_txt, pos_txt)
+
+    first = make_e5.run_clean_e5(seed=42)
+    assert first["loaded_from_frozen"] is False
+    assert first["n_dup"] == 0 and first["n_neg"] == 2
+    clean_csv = manifests / "reference_like_clean.csv"
+    assert clean_csv.exists()
+
+    _no_derivation(monkeypatch)
+    second = make_e5.run_clean_e5(seed=42)
+    assert second["loaded_from_frozen"] is True
+    assert second["manifest_sha256"] == sha256_file(clean_csv)
+    assert second["n_neg"] == 2 and second["n_pos"] == 1
+    assert second["n_dup"] == 0
+    assert second["checks"]["disjoint_from_pos"] is True
+    assert second["checks"]["unique"] is True
+
+    # A tampered frozen manifest still raises instead of being rebuilt.
+    clean_csv.write_text("image_id,label\nz,0\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        make_e5.run_clean_e5(seed=42)
+
+
+def test_e5_clean_load_first_needs_frozen_reference(tmp_path, monkeypatch):
+    manifests = tmp_path / "manifests"
+    monkeypatch.setattr(make_e5, "manifest_dir", lambda: manifests)
+    _no_derivation(monkeypatch)
+    with pytest.raises(RuntimeError, match="reference"):
+        make_e5.run_clean_e5(seed=42)
+
+
+def test_e5_reference_load_first_skips_the_author_lists(tmp_path, monkeypatch):
+    neg_txt, pos_txt = _fake_txt_pair(tmp_path, ["a", "b"], ["c"])
+    ref_dir = tmp_path / "ref"
+    combined = tmp_path / "combined.csv"
+    make_e5.freeze_reference_lists(neg_txt, pos_txt, ref_dir, combined)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("load-first path re-parsed the author lists")
+
+    monkeypatch.setattr(make_e5, "parse_txt_list", _explode)
+    monkeypatch.setattr(make_e5, "_copy_or_verify", _explode)
+    monkeypatch.setattr(make_e5, "run_reference_e5", make_e5.run_reference_e5)
+    report = make_e5.freeze_reference_lists(neg_txt, pos_txt, ref_dir, combined)
+    assert report["loaded_from_frozen"] is True
+    assert report["n_neg"] == 2 and report["n_pos"] == 1
+    assert report["n_dup"] == 0
+    assert report["combined_csv_sha256"] == sha256_file(combined)
+
+
+# ------------------------------------------------------------ E5 multi-draw
+
+
+def _multidraw_annotations(path: Path) -> Path:
+    """Candidates {c1, c2, c3, p1}; positives {p1, p2} -> |candidates ∩ pos| = 1."""
+    rows = [
+        ("c1", "Aortic enlargement"),
+        ("c2", "Cardiomegaly"),
+        ("c3", "Atelectasis"),
+        ("p1", "Pneumothorax"),
+        ("p1", "Aortic enlargement"),  # multi-finding row: p1 is also a candidate
+        ("p2", "Pneumothorax"),
+    ]
+    return _fake_annotations_csv(path, rows)
+
+
+def test_e5_multidraw_counts_duplicates_per_draw(tmp_path):
+    annotations = _multidraw_annotations(tmp_path / "train.csv")
+    out = tmp_path / "multidraw"
+    summary = e5_multidraw.run_multidraw(
+        seeds=[42, 7],
+        hashseeds=["0", "1"],
+        annotations_csv=str(annotations),
+        k=4,  # the whole candidate pool -> the draw always contains p1
+        out_dir=out,
+    )
+
+    assert summary["n_draws"] == 4
+    assert summary["n_dup_values"] == [1, 1, 1, 1]
+    assert summary["n_dup_distribution"] == {"1": 4}
+    assert summary["n_dup_min"] == summary["n_dup_max"] == 1
+    assert summary["role"].startswith("record-only")
+
+    prereg = json.loads((out / "preregistration.json").read_text())
+    assert prereg["written_before_draws"] is True
+    assert prereg["n_draws"] == 4
+    assert prereg["seeds"] == [42, 7]
+    assert prereg["hashseeds"] == ["0", "1"]
+    assert prereg["k"] == 4
+    assert prereg["annotations_csv_sha256"] == sha256_file(annotations)
+
+    draw_files = sorted((out / "draws").glob("draw_*.json"))
+    assert len(draw_files) == 4
+    frame = pd.read_csv(annotations)
+    negatives = set(frame.loc[frame["class_name"] != "Pneumothorax", "image_id"].astype(str))
+    positives = set(frame.loc[frame["class_name"] == "Pneumothorax", "image_id"].astype(str))
+    for draw_file, row in zip(draw_files, summary["draws"]):
+        payload = json.loads(draw_file.read_text())
+        assert payload["n_dup"] == len(set(payload["sample_ids"]) & positives)
+        assert payload["n_dup"] == row["n_dup"]
+        assert len(payload["sample_ids"]) == 4
+        assert set(payload["sample_ids"]) == negatives  # k == full pool
+        assert payload["pythonhashseed"] == row["hashseed"]
+
+
+def test_e5_multidraw_same_seed_and_hashseed_is_reproducible(tmp_path):
+    annotations = _multidraw_annotations(tmp_path / "train.csv")
+    first = e5_multidraw.run_multidraw(
+        seeds=[42],
+        hashseeds=["0", "1"],
+        annotations_csv=str(annotations),
+        k=2,
+        out_dir=tmp_path / "first",
+    )
+    second = e5_multidraw.run_multidraw(
+        seeds=[42],
+        hashseeds=["0", "1"],
+        annotations_csv=str(annotations),
+        k=2,
+        out_dir=tmp_path / "second",
+    )
+    assert [row["sample_sha256"] for row in first["draws"]] == [
+        row["sample_sha256"] for row in second["draws"]
+    ]
+    assert [row["n_dup"] for row in first["draws"]] == [
+        row["n_dup"] for row in second["draws"]
+    ]
+
+
+def test_e5_multidraw_refuses_to_overwrite(tmp_path):
+    annotations = _multidraw_annotations(tmp_path / "train.csv")
+    out = tmp_path / "multidraw"
+    e5_multidraw.run_multidraw(
+        seeds=[42], hashseeds=["0"], annotations_csv=str(annotations), k=2, out_dir=out
+    )
+    with pytest.raises(RuntimeError, match="already exists"):
+        e5_multidraw.run_multidraw(
+            seeds=[43],
+            hashseeds=["0"],
+            annotations_csv=str(annotations),
+            k=2,
+            out_dir=out,
+        )
+
+
+def test_e5_multidraw_requires_preregistered_draws(tmp_path):
+    annotations = _multidraw_annotations(tmp_path / "train.csv")
+    with pytest.raises(ValueError, match="Pre-register"):
+        e5_multidraw.run_multidraw(
+            hashseeds=["0"], annotations_csv=str(annotations), k=2, out_dir=tmp_path / "x"
+        )
+    with pytest.raises(ValueError, match="PYTHONHASHSEED"):
+        e5_multidraw.run_multidraw(
+            seeds=[42], annotations_csv=str(annotations), k=2, out_dir=tmp_path / "y"
+        )
+
+
+def test_e5_multidraw_never_touches_the_e5_manifests(tmp_path, monkeypatch):
+    manifests = tmp_path / "manifests"
+    monkeypatch.setattr(e5_multidraw, "manifest_dir", lambda: manifests)
+    monkeypatch.setattr(make_e5, "manifest_dir", lambda: manifests)
+    annotations = _multidraw_annotations(tmp_path / "train.csv")
+    summary = e5_multidraw.run_multidraw(
+        seeds=[42], hashseeds=["0"], annotations_csv=str(annotations), k=2
+    )
+    assert summary["n_draws"] == 1
+    assert sorted(p.name for p in manifests.iterdir()) == ["e5_multidraw"]
+    assert not (manifests / "reference_like_combined.csv").exists()
+    assert not (manifests / "reference_like_clean.csv").exists()
+
+    # E5-clean never reads the multi-draw record: without the frozen reference
+    # manifest it refuses instead of falling back to it.
+    monkeypatch.setattr(make_e5, "candidate_negative_ids", lambda *a, **k: [])
+    with pytest.raises(RuntimeError, match="reference"):
+        make_e5.run_clean_e5(seed=42)
 
 
 # ----------------------------------------------------------------- masked SIIM

@@ -107,6 +107,7 @@ CORRECTION_METHODS = ("bh",)
 PAIRED_DIFFERENCE = "b - a"
 UNCERTAINTY_UNITS = ("image",)
 CI_LEVEL = 0.95
+_AUROC_EQUAL_ATOL = 1e-12
 OUTPUT_COLUMNS = [
     "comparison_id",
     "endpoint_class",
@@ -678,10 +679,16 @@ def delong_paired(
     The pinned MLstatkit `Delong_test(true, prob_A, prob_B)` returns `(z, p)` and is the
     only implementation used (PTX-24 records the version in the run JSON). The installed
     build returns the negated absolute z, so the reported statistic is `|z|` (a two-sided
-    test has no meaningful sign). When the AUROC difference has zero variance (identical
-    predictions or rank-equivalent scores) MLstatkit returns `(nan, nan)`; the limit is
-    recorded explicitly as `statistic=0.0, p_raw=1.0, degenerate=True` instead of
-    propagating a NaN into Benjamini-Hochberg.
+    test has no meaningful sign).
+
+    Non-finite output is split by the observed AUROC difference, never collapsed:
+    - AUROC_A == AUROC_B (within 1e-12) -> the zero difference has zero variance; the
+      limit is recorded explicitly as `statistic=0.0, p_raw=1.0, degenerate=True`
+      (identical predictions or rank-equivalent scores), instead of a NaN reaching BH.
+    - AUROC_A != AUROC_B -> a non-finite/zero-variance statistic means the variance
+      estimate collapsed while the effect is nonzero (e.g. perfect separation with
+      reversed scores); inference is undefined and this raises ValueError. A valid
+      p-value is never replaced by 1.
     """
     y = np.asarray(labels)
     pa = np.asarray(prob_a, dtype=float)
@@ -707,7 +714,14 @@ def delong_paired(
         )
     z_value, p_value = float(result[0]), float(result[1])
     if not np.isfinite(z_value) or not np.isfinite(p_value):
-        return 0.0, 1.0, True
+        auroc_a = float(roc_auc_score(y, pa))
+        auroc_b = float(roc_auc_score(y, pb))
+        if abs(auroc_a - auroc_b) <= _AUROC_EQUAL_ATOL:
+            return 0.0, 1.0, True
+        raise ValueError(
+            "DeLong variance is zero with a nonzero AUROC difference; inference "
+            f"undefined (AUROC_A={auroc_a}, AUROC_B={auroc_b}, z={z_value}, p={p_value})"
+        )
     return abs(z_value), p_value, False
 
 

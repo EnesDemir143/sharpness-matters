@@ -148,6 +148,23 @@ def evaluate_fold(fold_number: int, val_loader: DataLoader, model: torch.nn.Modu
     return {"logits": all_logits, "labels": np.array(all_labels)}
 
 
+def classification_collate(
+    batch: List[Dict[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
+    """Collate only the classification inputs: `data` stacked, `label` as a tensor.
+
+    # B (§6.6 / §7.1): current -> the evaluation loader used the default collate;
+    #   problem -> the classification datasets carry a `mask` whose type and grid
+    #   differ per source (VinDataset: [1,s,s] tensor, PTX498: native-grid numpy), so a
+    #   batch crossing the Vin->PTX498 boundary of the ConcatDataset crashed on a key
+    #   the classifier never reads; new -> every other key is ignored here.
+    #   check: tests/corrected/test_classif_eval.py::test_collate_spans_mixed_masks
+    """
+    data = torch.stack([item["data"] for item in batch], dim=0)
+    labels = torch.as_tensor([int(item["label"]) for item in batch], dtype=torch.long)
+    return {"data": data, "label": labels}
+
+
 def _dataset_order_labels(dataset: Dataset, ids: List[str]) -> Optional[np.ndarray]:
     """Dataset-order labels when the dataset exposes an `image_id -> label` dict.
 
@@ -239,7 +256,13 @@ def eval_res(
             f"label/id length mismatch: {len(expected_labels)} labels vs {len(ids)} ids"
         )
 
-    val_loader = DataLoader(dataset, batch_size=32, num_workers=8, shuffle=False)
+    val_loader = DataLoader(
+        dataset,
+        batch_size=32,
+        num_workers=8,
+        shuffle=False,
+        collate_fn=classification_collate,
+    )
     fold_probs = []
     fold_labels = []
     metrics = {"acc": [], "auc": [], "f1": []}

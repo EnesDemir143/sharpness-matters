@@ -17,7 +17,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning import LightningModule
 from torch import nn
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 from sharpness_matters.config.load_config import cfg
 from sharpness_matters.ptx.utils import classification_eval
@@ -282,3 +282,52 @@ def test_caller_labels_mismatch_raises(ckpt_dir):
             ids=IDS,
             labels=np.asarray([1, 0, 1, 0]),
         )
+
+
+class MaskedVinLikeDataset(LogitDataset):
+    """Item shape of VinDataset in B: `mask` is a [1,s,s] tensor."""
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        item["mask"] = torch.ones(1, 4, 4)
+        return item
+
+
+class MaskedPTX498LikeDataset(LogitDataset):
+    """Item shape of OODTestDataset in B: `mask` is a non-square numpy grid."""
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        item["mask"] = np.zeros((3, 5), dtype=np.uint8)
+        item["pid"] = self.image_ids[index]
+        return item
+
+
+def test_collate_spans_mixed_masks(ckpt_dir):
+    _write_record(ckpt_dir, FOLD_BIASES, tau=0.7)
+    ids = ["v1", "v2", "p1", "p2"]
+    dataset = ConcatDataset(
+        [
+            MaskedVinLikeDataset([0.4055, 1.3863], [0, 1], ids=ids[:2]),
+            MaskedPTX498LikeDataset([-0.4055, 2.1972], [1, 1], ids=ids[2:]),
+        ]
+    )
+    # A single batch spans the Vin -> PTX498 boundary; the default collate would try
+    # to stack a [1,4,4] tensor with a (3,5) numpy grid on the unused `mask` key.
+    batch = [dataset[index] for index in range(len(dataset))]
+    with pytest.raises((TypeError, RuntimeError)):
+        torch.utils.data.default_collate(batch)
+
+    pred_df, _ = classification_eval.eval_res(
+        dataset,
+        IMG_SIZE,
+        MODEL_NAME,
+        TinyClassifier,
+        LOGGER,
+        ids=ids,
+        labels=np.asarray([0, 1, 1, 1]),
+    )
+
+    assert list(pred_df["image_id"]) == ids
+    assert list(pred_df["label"]) == [0, 1, 1, 1]
+    assert len(pred_df) == len(ids)

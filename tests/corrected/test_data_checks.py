@@ -57,7 +57,8 @@ def write_dicom(
     pixels = np.asarray(pixels)
     dataset.Rows, dataset.Columns = pixels.shape
     dataset.SamplesPerPixel = 1
-    dataset.PhotometricInterpretation = photometric
+    if photometric is not None:
+        dataset.PhotometricInterpretation = photometric
     dataset.BitsAllocated = bits_allocated
     dataset.BitsStored = bits_stored
     dataset.HighBit = bits_stored - 1
@@ -262,7 +263,153 @@ def test_vindr_decode_difference_is_open(tmp_path, monkeypatch):
     assert comparison["n_pixels"] == 16
 
 
-# ------------------------------------------------------ 9.4 SIIM ImageId mapping
+def test_vindr_only_corrupt_dicom_is_open(tmp_path):
+    root = tmp_path / "vindr"
+    root.mkdir(parents=True)
+    (root / "bad.dicom").write_bytes(b"this is not a dicom file")
+
+    check = data_checks.check_vindr_bit_depth(root, samples_per_group=2)
+
+    assert check["status"].startswith("OPEN")
+    assert "0 of 1 DICOM file(s) could be decoded" in check["status"]
+    assert check["data"]["n_sampled"] == 0
+    assert check["data"]["n_unreadable"] == 1
+    assert check["data"]["unreadable_files"][0]["file"] == "bad.dicom"
+
+
+def test_vindr_mixed_good_and_corrupt_dicom_is_open(tmp_path):
+    root = tmp_path / "vindr"
+    write_dicom(root / "good.dicom", PIXELS_4X4, bits_stored=12)
+    (root / "bad.dicom").write_bytes(b"this is not a dicom file")
+
+    check = data_checks.check_vindr_bit_depth(root, samples_per_group=2)
+
+    assert check["status"].startswith("OPEN")
+    assert "unreadable header" in check["status"]
+    assert "only 1 file(s) were compared" in check["status"]
+    assert check["data"]["n_unreadable"] == 1
+    assert check["data"]["n_equal"] == 1
+    assert check["data"]["n_sampled"] == 1
+
+
+def test_vindr_failed_decode_is_open(tmp_path, monkeypatch):
+    root = tmp_path / "vindr"
+    write_dicom(root / "v1.dicom", PIXELS_4X4, bits_stored=12)
+
+    def broken(path):
+        raise RuntimeError("synthetic decoder failure")
+
+    monkeypatch.setattr(data_checks, "decode_unmodified", broken)
+
+    check = data_checks.check_vindr_bit_depth(root, samples_per_group=1)
+
+    assert check["status"].startswith("OPEN")
+    assert "decode failure" in check["status"]
+    assert check["data"]["n_failed"] == 1
+    assert check["data"]["n_sampled"] == 1
+
+
+def test_photometric_corrupt_dicom_is_open(tmp_path):
+    root = tmp_path / "vindr"
+    root.mkdir(parents=True)
+    (root / "bad.dicom").write_bytes(b"this is not a dicom file")
+
+    check = data_checks.check_photometric(
+        root, "VinDr", data_checks.VINDR_DICOM_PATTERNS
+    )
+
+    assert check["status"].startswith("OPEN")
+    assert check["data"]["n_unreadable"] == 1
+
+
+def test_photometric_missing_tag_is_open(tmp_path):
+    root = tmp_path / "vindr"
+    write_dicom(root / "absent.dicom", PIXELS_4X4, photometric=None)
+    write_dicom(root / "empty.dicom", PIXELS_4X4, photometric="")
+    write_dicom(root / "ok.dicom", PIXELS_4X4)
+
+    check = data_checks.check_photometric(
+        root, "VinDr", data_checks.VINDR_DICOM_PATTERNS
+    )
+
+    assert check["status"].startswith("OPEN")
+    assert "missing" in check["status"]
+    assert check["data"]["missing_tag_count"] == 2
+    assert sorted(check["data"]["missing_tag_ids"]) == ["absent", "empty"]
+
+
+def test_photometric_root_without_dicom_is_open(tmp_path):
+    root = tmp_path / "siim"
+    root.mkdir(parents=True)
+
+    check = data_checks.check_photometric(
+        root, "SIIM-ACR", data_checks.SIIM_DICOM_PATTERNS
+    )
+
+    assert check["status"].startswith("OPEN")
+    assert check["data"]["n_dicom_files"] == 0
+
+
+def test_ptx498_unreadable_mask_is_open(tmp_path):
+    root = tmp_path / "ptx498"
+    site = root / "SiteA"
+    site.mkdir(parents=True)
+    (site / "1.5.mask.nii.gz").write_bytes(b"this is not a nifti file")
+
+    check = data_checks.check_ptx498_masks(root)
+
+    assert check["status"].startswith("OPEN")
+    assert check["data"]["n_unreadable_files"] == 1
+    assert check["data"]["n_mask_files"] == 1
+    empty_check = data_checks.check_empty_gt_masks(ptx498_root=root)
+    assert empty_check["data"]["datasets"]["ptx498"]["n_unreadable"] == 1
+    assert empty_check["status"].startswith("OPEN")
+
+
+def test_empty_gt_no_mask_files_is_open(tmp_path):
+    ptx_root = tmp_path / "ptx498"
+    (ptx_root / "SiteA").mkdir(parents=True)
+    siim_root = tmp_path / "siim"
+    write_rle_csv(siim_root / "train-rle.csv", ["p1", "n1"], {"p1": " 1 4"})
+
+    check = data_checks.check_empty_gt_masks(siim_root=siim_root, ptx498_root=ptx_root)
+
+    assert check["status"].startswith("OPEN")
+    assert "0 mask file" in check["status"]
+    assert check["data"]["datasets"]["ptx498"]["n_masks"] == 0
+
+
+def test_empty_gt_no_positive_ids_is_open(tmp_path):
+    ptx_root = tmp_path / "ptx498"
+    foreground = np.zeros((4, 4), dtype=np.uint8)
+    foreground[0, :] = 1
+    write_nifti(ptx_root / "SiteA" / "1.5.mask.nii.gz", foreground)
+    siim_root = tmp_path / "siim"
+    write_rle_csv(siim_root / "train-rle.csv", ["n1", "n2"], {})
+
+    check = data_checks.check_empty_gt_masks(siim_root=siim_root, ptx498_root=ptx_root)
+
+    assert check["status"].startswith("OPEN")
+    assert "0 positive ImageId" in check["status"]
+    assert check["data"]["datasets"]["siim"]["n_positive_ids"] == 0
+
+
+def test_empty_gt_malformed_rle_is_open(tmp_path):
+    siim_root = tmp_path / "siim"
+    write_rle_csv(siim_root / "train-rle.csv", ["p1", "p2"], {"p1": " 1 4", "p2": "nope"})
+    ptx_root = tmp_path / "ptx498"
+    foreground = np.zeros((4, 4), dtype=np.uint8)
+    foreground[0, :] = 1
+    write_nifti(ptx_root / "SiteA" / "1.5.mask.nii.gz", foreground)
+
+    check = data_checks.check_empty_gt_masks(siim_root=siim_root, ptx498_root=ptx_root)
+
+    assert check["status"].startswith("OPEN")
+    assert check["data"]["datasets"]["siim"]["n_malformed"] == 1
+    assert check["data"]["datasets"]["siim"]["empty_ids"] == []
+
+
+# -------------------------------------------------------- 9.4 SIIM ImageId mapping
 
 
 def test_siim_mapping_duplicate_stem_is_issue(tmp_path):
