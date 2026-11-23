@@ -52,10 +52,10 @@ Run every command below from the repository root with `uv run` (or `source .venv
 
 `pip install -r requirements.txt` installs the same pinned versions but uv is the supported path.
 
-### Tests (synthetic data only, no downloads)
+### Tests
 
 ```bash
-uv run python -m pytest -q tests/corrected
+uv run python -m pytest -q tests/corrected          # synthetic data only, no downloads
 uv run python -m pytest -q tests/data_integration   # read-only checks on real data + frozen manifests; skipped when the data is absent
 ```
 
