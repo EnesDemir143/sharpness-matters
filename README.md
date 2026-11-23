@@ -29,27 +29,27 @@ Training deep learning chest radiograph classifiers at higher resolutions result
 
 ## Installation
 
+> **Branch `stage1-reference`:** the author's method unchanged (reference-like run A). Only environment pinning, the PTX config-key fixes (PTX-23a/b) and ID-keyed prediction output were added. The environment is pinned in `uv.lock`; `requirements.txt` is exported from the lock.
+
 ### Prerequisites
--  Python 3.8.10
+- [uv](https://docs.astral.sh/uv/) (tested with 0.7.3)
+- Python 3.8.x (`~=3.8.10`; uv installs 3.8.20 if missing)
 - CUDA-compatible GPU (recommended)
 
 ### Quick Start
 
-1. **Clone the repository**
-    ```bash
-    git clone https://github.com/your-username/sharpness_matters.git
-    cd sharpness_matters
-    ```
+```bash
+git clone https://github.com/EnesDemir143/sharpness-matters.git
+cd sharpness-matters
+git switch stage1-reference
 
-2. **Create conda environment and install**
-    ```bash
-    conda create -n sharpness_matters python=3.8.10
-    conda activate sharpness_matters
-    pip install -e .
-    
-    # For development (optional)
-    pip install -e .[dev]
-    ```
+uv python install 3.8.20
+uv sync --python 3.8.20              # creates .venv from uv.lock (torch 2.1.0, torchvision 0.16.0)
+uv sync --python 3.8.20 --extra dev  # optional: pytest for the test suite
+uv run python -m pytest -q tests/stage1   # synthetic checks, no data needed
+```
+
+Prefix the commands below with `uv run` (or `source .venv/bin/activate` first). `pip install -r requirements.txt` installs the same pinned versions.
 
 ## Datasets Used
 
@@ -122,55 +122,51 @@ cd sharpness_matters/pneumonia
 
 **Train pneumothorax classifier:**
 ```bash
-python train/train_kfold.py --model_name densenet
-```
-
-**Train pneumonia classifier:**
-```bash
-python train/train_kfold.py --model_name resnet
+uv run python train/train_kfold.py --model_name densenet
+uv run python train/train_kfold.py --model_name resnet
 ```
 
 ### Hyperparameter Optimization (Optional Ablation)
 
 ```bash
-python train/train_sweep.py
+uv run python train/train_sweep.py
 ```
 
 ### Evaluation
 
-**Classification performance:**
+**Classification performance:** besides the original `.npy` files, each run writes `output/classif_preds/<mode>pred_<model>_<size>_ids.csv` (`image_id, source, label, score`).
 ```bash
-python evaluation/evaluate_kfold.py --validation_mode holdout
+uv run python evaluation/evaluate_kfold.py --validation_mode holdout
 
-# If using ptx (vindr) else skip the next line
-python dataset/create_vin_dr_subset.py
-
-python evaluation/evaluate_kfold.py --validation_mode ood
+# VinDr lists: output/vin500neg.txt and output/vin500pos.txt must exist.
+# For run A use the frozen copies produced on stage2-corrected
+# (manifests/reference_like/, `make_e5 reference`) instead of re-running the selector.
+uv run python evaluation/evaluate_kfold.py --validation_mode ood
 ```
 
 **Saliency map evaluation:**
 ```bash
 # Internal test set
-python evaluation/evaluate_saliency.py
+uv run python evaluation/evaluate_saliency.py
 
 # External test set
-python evaluation/evaluate_saliency_ood.py
+uv run python evaluation/evaluate_saliency_ood.py
 ```
 
 ### Statistical Analysis
 
 ```bash
 # Classification performance significance testing
-python evaluation/p_value_classification.py --dataset holdout --model_name densenet
+uv run python evaluation/p_value_classification.py --dataset holdout --model_name densenet
 
 # Saliency map quality significance testing  
-python evaluation/p_value_saliency.py --dataset external --model_name resnet
+uv run python evaluation/p_value_saliency.py --dataset external --model_name resnet
 ```
 
 ### Performance Benchmarking
 
 ```bash
-python evaluation/computational_usage.py --model_name densenet
+uv run python evaluation/computational_usage.py --model_name densenet
 ```
 
 ## Citation
