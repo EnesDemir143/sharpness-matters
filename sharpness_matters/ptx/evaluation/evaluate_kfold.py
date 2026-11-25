@@ -13,17 +13,13 @@ predictions are saved keyed by ImageId for further analysis.
 #   (`image_id,source,label,prob,prob_fold*`) named by validation_mode.
 # B (Section 6.3): the decision threshold is the baseline's own OOF tau.
 # B (Section 6.5 / §8.1): the legacy `.npy` files are still written because
-#   `p_value_classification.py` reads them (`oodpred_*`, `holdoutpred_*`, `*gt.npy`);
-#   that script is not part of B, but keeping the files avoids breaking a reader on the
-#   branch. E5-clean has no legacy name, so it gets its own `ood_clean` prefix.
-# B (§4.4 E2 / E4): current -> the evaluator knew only the internal holdout and the two
-#   E5 VinDr+PTX-498 runs, so the protocol's external rows had no prediction file.
-#   New -> `vindr_test` evaluates the VinDr official test manifest (E2) and
-#   `chexlocalize` evaluates the CheXlocalize classification manifest (E4); both keep
-#   the ID-keyed CSV and the run's own tau, `source` is `vindr_test` /
-#   `chexlocalize_<split>`, and the E4 CSV additionally keeps `split` and
-#   `patient_id`. E2 needs no `--e5_manifest` (its ids come from the frozen E2
-#   manifest).
+#   `p_value_classification.py` reads them (`holdoutpred_*`, `*gt.npy`); that script is
+#   not part of B, but keeping the files avoids breaking a reader on the branch.
+# B (§4.4 E2 / E4): the evaluator reads `vindr_test` (the VinDr-CXR v1.0.0 official-test
+#   subset of E2) and `chexlocalize` (E4 = the CheXlocalize classification
+#   manifest); both keep the ID-keyed CSV and the run's own tau, `source` is
+#   `vindr_test` / `chexlocalize_<split>`, and the E4 CSV additionally keeps `split`
+#   and `patient_id`. E2 ids come from its frozen manifest.
 #   check: tests/corrected/test_e2_e4_eval.py::test_vindr_test_mode_writes_id_csv,
 #   ::test_chexlocalize_mode_keeps_split_and_patient_id,
 #   ::test_cli_help_lists_e2_e4_modes
@@ -39,15 +35,14 @@ predictions are saved keyed by ImageId for further analysis.
 
 # B (Section 4.7 / 6.1): every cohort below is read from an existing frozen artifact
 #   (`frozen.load_frozen` checks csv + .sha256 + .record.json) and the loaded dataset is
-#   compared with that frame; nothing is rebuilt. E5 additionally binds each mode to its
-#   canonical manifest (`eval_manifests.load_e5_manifest`), so E5-clean passed to
-#   ood_reference_like (or a renamed copy of it) is refused before inference.
+#   compared with that frame; nothing is rebuilt.
 #   check: tests/corrected/test_manifest_eval_integrity.py
+# B (25 Kasım 2026 decision): E5 is evaluated only by run A (stage1 reference); this
+#   evaluator has no E5 mode and no E5 manifest option.
 #
 # Usage:
     Run this module directly:
         python3 evaluate_kfold.py --validation_mode=<validation_dataset>
-        python3 evaluate_kfold.py --validation_mode=ood_clean --e5_manifest=manifests/reference_like_clean.csv
         python3 evaluate_kfold.py --validation_mode=vindr_test   # E2
         python3 evaluate_kfold.py --validation_mode=vindr_wide   # E2-wide (secondary)
         python3 evaluate_kfold.py --validation_mode=chexlocalize  # E4
@@ -74,7 +69,6 @@ from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
     ChestXrayDataset,
 )
 from sharpness_matters.ptx.datasets.vin_dataset import VinDataset
-from sharpness_matters.ptx.datasets.ptx498_dataset import OODTestDataset
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
 from sharpness_matters.ptx.corrected.frozen import (
     load_frozen,
@@ -83,7 +77,6 @@ from sharpness_matters.ptx.corrected.frozen import (
 )
 from sharpness_matters.ptx.corrected.cv_record import load_cv_record
 from sharpness_matters.ptx.corrected.eval_manifests import (
-    load_e5_manifest,
     verify_dataset_against_frozen,
 )
 from sharpness_matters.ptx.corrected.make_fold_manifest import FOLD_MANIFEST_NAME
@@ -115,8 +108,6 @@ logger.debug(f"Output Root: {HOME}")
 # Manifest names come from their builders (single source of truth, §4.4 E2/E2-wide/E4).
 VALIDATION_MODES = (
     "holdout",
-    "ood_reference_like",
-    "ood_clean",
     "vindr_test",
     "vindr_wide",
     "chexlocalize",
@@ -126,13 +117,11 @@ VALIDATION_MODES = (
 def _legacy_npy_prefix(validation_mode: str) -> str:
     """Prefix of the author's `.npy` files, which `p_value_classification.py` reads.
 
-    The author's E5 run is the reference-like manifest, so that run keeps the `ood`
-    prefix; E5-clean gets its own prefix rather than overwriting it.
+    The internal holdout keeps the author's `holdout` prefix; every other cohort is
+    named after its validation mode.
     """
     if validation_mode == "holdout":
         return "holdout"
-    if validation_mode == "ood_reference_like":
-        return "ood"
     return validation_mode
 
 
@@ -174,7 +163,6 @@ def fetch_results_per_resolution(
     img_size: int = 512,
     model_name: str = "resnet",
     validation_mode: str = "holdout",
-    e5_manifest: str = None,
 ) -> Dict[str, Any]:
     """
     Evaluate model performance for a specific image resolution and validation dataset.
@@ -182,12 +170,9 @@ def fetch_results_per_resolution(
     Args:
         img_size (int): Input image size for model evaluation
         model_name (str): Model architecture ('resnet' or 'densenet')
-        validation_mode (str): Validation dataset ('holdout', 'ood_reference_like',
-            'ood_clean', 'vindr_test', 'vindr_wide' or 'chexlocalize'); the E5 variants
-            are separate runs with separate manifests, E2/E2-wide/E4 read their own
-            frozen manifests.
-        e5_manifest (str): ID+label manifest of the E5 run (required for the E5 modes;
-            unused by E2/E2-wide/E4, whose cohorts come from their frozen manifests)
+        validation_mode (str): Validation dataset ('holdout', 'vindr_test',
+            'vindr_wide' or 'chexlocalize'); each cohort reads its own frozen manifest.
+            E5 has no mode here: it is evaluated only by run A (25 Kasım 2026 decision).
 
     Returns:
         Dict[str, Any]: Dictionary containing evaluation metrics; `vindr_wide` adds the
@@ -247,29 +232,6 @@ def fetch_results_per_resolution(
                 f"{len(mismatched)} ids, e.g. {mismatched[:5]}"
             )
         sources = ["siim_acr"] * len(ids)
-    elif validation_mode in ("ood_reference_like", "ood_clean"):
-        if not e5_manifest:
-            raise ValueError(
-                f"validation_mode={validation_mode} needs the E5 manifest path "
-                "(reference-like and clean are different ID sets)"
-            )
-        # B (Section 4.7 / 6.1): the mode owns one frozen cohort. The path must be
-        # frozen and carry that cohort's content; the other mode's manifest (or a
-        # renamed copy of it) is rejected here, before any dataset or checkpoint.
-        e5_path, e5_frame = load_e5_manifest(
-            validation_mode, e5_manifest, manifest_dir()
-        )
-        vin_ds = VinDataset(manifest_csv=str(e5_path), img_size=img_size)
-        verify_dataset_against_frozen(
-            vin_ds, e5_frame, what=f"{validation_mode} VinDr cohort"
-        )
-        ptx_ds = OODTestDataset(img_size=img_size)
-        dataset = ConcatDataset([vin_ds, ptx_ds])
-        ids = list(vin_ds.image_ids) + list(ptx_ds.image_ids)
-        sources = ["vindr"] * len(vin_ds.image_ids) + ["ptx498"] * len(ptx_ds.image_ids)
-        expected = [int(vin_ds.labels[i]) for i in vin_ds.image_ids] + [1] * len(
-            ptx_ds.image_ids
-        )
     elif validation_mode == "vindr_test":
         # B (§4.4 E2): official test split only; no PTX-498 images are mixed in, so the
         # positives and negatives come from the same validated VinDr cohort.
@@ -458,29 +420,18 @@ def fetch_results_per_resolution(
     "--validation_mode",
     type=click.Choice(list(VALIDATION_MODES)),
     required=True,
-    help="Choose validation dataset: holdout, ood_reference_like, ood_clean "
-    "(internal holdout and the two E5 runs) or vindr_test, vindr_wide, chexlocalize "
-    "(E2, E2-wide, E4)",
+    help="Choose validation dataset: holdout (internal holdout), vindr_test or "
+    "vindr_wide (E2 official-test subset / all 18,000 images) or chexlocalize (E4)",
 )
-@click.option(
-    "--e5_manifest",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="ID+label manifest of the E5 run (required for ood_reference_like / ood_clean)",
-)
-def main(validation_mode: str, e5_manifest: str) -> None:
+def main(validation_mode: str) -> None:
     """
     Main function to run the evaluation for the baseline resolution.
 
     Args:
-        validation_mode (str): Validation dataset ('holdout', 'ood_reference_like',
-            'ood_clean', 'vindr_test' or 'chexlocalize')
-        e5_manifest (str): E5 manifest path (required for the E5 modes)
+        validation_mode (str): Validation dataset ('holdout', 'vindr_test',
+            'vindr_wide' or 'chexlocalize'); E5 is evaluated only by run A, so it is
+            not a mode here (25 Kasım 2026 decision).
     """
-    if validation_mode.startswith("ood") and not e5_manifest:
-        raise click.UsageError(
-            "--e5_manifest is required for ood_reference_like / ood_clean"
-        )
     seed = 42
     pl.seed_everything(seed)
     generator = torch.Generator()
@@ -490,9 +441,7 @@ def main(validation_mode: str, e5_manifest: str) -> None:
         out = []
         # B (Section 5.1): only the baseline resolution is evaluated in stage 2
         for img_size in [512]:
-            res = fetch_results_per_resolution(
-                img_size, model_name, validation_mode, e5_manifest
-            )
+            res = fetch_results_per_resolution(img_size, model_name, validation_mode)
             res["img_size"] = img_size
             out.append(res)
             df = pd.DataFrame(out)

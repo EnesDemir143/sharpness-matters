@@ -5,9 +5,9 @@ Synthetic manifests only: each test freezes a tiny csv with its `.sha256` and
 renamed artifact before any dataset/model/output work. The valid cases use a stubbed
 `eval_res`/`run_experiment`, so no checkpoint, image or real cohort is needed.
 
-Covers `sharpness_matters.ptx.corrected.eval_manifests`,
-`sharpness_matters.ptx.evaluation.evaluate_kfold` (E2, E2-wide, E4, E5) and
-`sharpness_matters.ptx.evaluation.evaluate_saliency_chexlocalize` (E4 XAI).
+Covers `sharpness_matters.ptx.evaluation.evaluate_kfold` (holdout, E2, E4) and
+`sharpness_matters.ptx.evaluation.evaluate_saliency_chexlocalize` (E4 XAI). E5 is
+evaluated only by run A (25 Kasım 2026 decision), so it has no path here.
 """
 
 import hashlib
@@ -16,33 +16,16 @@ import sys
 import types
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 import torch
 from torch.utils.data import Dataset
 
-from sharpness_matters.ptx.corrected import eval_manifests
 from sharpness_matters.ptx.evaluation import evaluate_kfold
 from sharpness_matters.ptx.evaluation import evaluate_saliency_chexlocalize as eval_chx
 
 IMG_SIZE = 512
 MODEL_NAME = "resnet"
-
-E5_COMBINED = pd.DataFrame(
-    {
-        "image_id": ["vin_a", "vin_b", "vin_c"],
-        "label": [0, 1, 0],
-        "source_list": ["neg", "pos", "neg"],
-    }
-)
-E5_CLEAN = pd.DataFrame(
-    {"image_id": ["vin_a", "vin_b", "vin_d"], "label": [0, 1, 0]}
-)
-REFERENCE_ITEM = "PTX-03/PTX-08 E5 reference-like (unmodified author script)"
-CLEAN_ITEM = "PTX-03/PTX-08 E5-clean negative manifest"
-COMBINED_NAME = "reference_like_combined.csv"
-CLEAN_NAME = "reference_like_clean.csv"
 
 
 # --------------------------------------------------------------------------- helpers
@@ -61,13 +44,6 @@ def _freeze(path: Path, frame: pd.DataFrame, item: str = "test artifact") -> Pat
     record = {"csv": str(path), "csv_sha256": digest, "item": item}
     Path(str(path) + ".record.json").write_text(json.dumps(record), encoding="utf-8")
     return path
-
-
-def _e5_dir(tmp_path: Path) -> Path:
-    root = tmp_path / "manifests"
-    _freeze(root / COMBINED_NAME, E5_COMBINED, REFERENCE_ITEM)
-    _freeze(root / CLEAN_NAME, E5_CLEAN, CLEAN_ITEM)
-    return root
 
 
 def _explode(*args, **kwargs):
@@ -93,160 +69,32 @@ class _Cohort(Dataset):
         }
 
 
-def _fake_eval_res(dataset, img_size, model_name, model_cls, logger, **kwargs):
-    ids = [str(value) for value in kwargs["ids"]]
-    labels = [int(value) for value in kwargs["labels"]]
-    probs = np.linspace(0.1, 0.9, len(ids))
-    frame = pd.DataFrame(
-        {
-            "image_id": ids,
-            "label": labels,
-            "prob": probs,
-            "prob_fold0": probs,
-        }
-    )
-    return frame, {"auc": 0.5, "tau": 0.5}
+# ------------------------------------------------- removed E5 evaluation modes
 
-
-# ----------------------------------------------------------------- E5 manifest binding
-
-
-def test_e5_modes_load_their_canonical_frozen_manifest(tmp_path):
-    root = _e5_dir(tmp_path)
-
-    combined_path, combined = eval_manifests.load_e5_manifest(
-        "ood_reference_like", None, root
-    )
-    clean_path, clean = eval_manifests.load_e5_manifest(
-        "ood_clean", str(root / CLEAN_NAME), root
-    )
-
-    assert combined_path == root / COMBINED_NAME
-    assert clean_path == root / CLEAN_NAME
-    assert combined["image_id"].tolist() == E5_COMBINED["image_id"].tolist()
-    assert clean["image_id"].tolist() == E5_CLEAN["image_id"].tolist()
-    assert combined["label"].tolist() == [0, 1, 0]
-    assert clean["label"].tolist() == [0, 1, 0]
-
-
-def test_e5_unknown_mode_is_rejected(tmp_path):
-    with pytest.raises(ValueError, match="not an E5 mode"):
-        eval_manifests.load_e5_manifest("holdout", None, _e5_dir(tmp_path))
-
-
-def test_e5_swapped_modes_are_rejected(tmp_path):
-    root = _e5_dir(tmp_path)
-
-    with pytest.raises(RuntimeError, match="not the frozen artifact"):
-        eval_manifests.load_e5_manifest(
-            "ood_reference_like", str(root / CLEAN_NAME), root
-        )
-    with pytest.raises(RuntimeError, match="not the frozen artifact"):
-        eval_manifests.load_e5_manifest(
-            "ood_clean", str(root / COMBINED_NAME), root
-        )
-
-
-def test_e5_renamed_manifest_is_rejected(tmp_path):
-    # The canonical clean path holds the reference-like cohort and record: only the
-    # creation record's identity can tell the two apart once the file name is reused.
-    root = tmp_path / "renamed"
-    _freeze(root / COMBINED_NAME, E5_COMBINED, REFERENCE_ITEM)
-    _freeze(root / CLEAN_NAME, E5_COMBINED, REFERENCE_ITEM)
-
-    with pytest.raises(RuntimeError, match="E5-clean"):
-        eval_manifests.load_e5_manifest("ood_clean", None, root)
-
-    # A frozen copy of the clean cohort under another name is the wrong content for
-    # reference-like, even though its own hash/record verify.
-    copy = tmp_path / "copied" / "clean_copy.csv"
-    _freeze(copy, E5_CLEAN, CLEAN_ITEM)
-    with pytest.raises(RuntimeError, match="content differs"):
-        eval_manifests.load_e5_manifest("ood_reference_like", str(copy), root)
-
-
-def test_e5_tampered_manifest_fails_hash_check(tmp_path):
-    root = _e5_dir(tmp_path)
-    clean_csv = root / CLEAN_NAME
-    tampered = pd.read_csv(clean_csv, dtype={"image_id": str})
-    tampered.loc[0, "label"] = 1
-    tampered.to_csv(clean_csv, index=False)
-
-    with pytest.raises(RuntimeError, match="hash mismatch"):
-        eval_manifests.load_e5_manifest("ood_clean", None, root)
-    with pytest.raises(RuntimeError, match="hash mismatch"):
-        eval_manifests.load_e5_manifest("ood_clean", str(clean_csv), root)
-
-
-@pytest.mark.parametrize("suffix", [".sha256", ".record.json"])
-def test_e5_missing_sidecar_is_rejected(tmp_path, suffix):
-    root = _e5_dir(tmp_path)
-    Path(str(root / CLEAN_NAME) + suffix).unlink()
-
-    with pytest.raises(RuntimeError, match="missing"):
-        eval_manifests.load_e5_manifest("ood_clean", None, root)
-
-
-# ---------------------------------------------------------- E5 evaluation entry point
-
-
-def test_e5_eval_rejects_swapped_mode_before_dataset_or_output(tmp_path, monkeypatch):
-    root = _e5_dir(tmp_path)
-    home = tmp_path / "home"
-    monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: root)
-    monkeypatch.setattr(evaluate_kfold, "HOME", home)
-    monkeypatch.setattr(evaluate_kfold, "VinDataset", _explode)
-    monkeypatch.setattr(evaluate_kfold, "OODTestDataset", _explode)
+@pytest.mark.parametrize("removed_mode", ["ood_reference_like", "ood_clean"])
+def test_removed_e5_modes_are_not_valid_validation_modes(
+    removed_mode, tmp_path, monkeypatch
+):
+    # B does not evaluate E5 (25 Kasım 2026 decision): run A owns that row, so the
+    # dispatch must reject both E5 modes and name only the remaining cohorts.
+    monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: tmp_path / "manifests")
+    monkeypatch.setattr(evaluate_kfold, "HOME", tmp_path / "home")
     monkeypatch.setattr(evaluate_kfold, "eval_res", _explode)
 
-    with pytest.raises(RuntimeError, match="not the frozen artifact"):
-        evaluate_kfold.fetch_results_per_resolution(
-            IMG_SIZE,
-            MODEL_NAME,
-            "ood_reference_like",
-            e5_manifest=str(root / CLEAN_NAME),
-        )
+    with pytest.raises(ValueError, match="Invalid validation mode") as exc_info:
+        evaluate_kfold.fetch_results_per_resolution(IMG_SIZE, MODEL_NAME, removed_mode)
 
-    assert not (home / "output").exists()
-
-
-def test_e5_eval_loads_matching_frozen_manifests(tmp_path, monkeypatch):
-    root = _e5_dir(tmp_path)
-    home = tmp_path / "home"
-    monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: root)
-    monkeypatch.setattr(evaluate_kfold, "HOME", home)
-    monkeypatch.setattr(evaluate_kfold, "eval_res", _fake_eval_res)
-    captured = {}
-
-    def fake_vin(manifest_csv=None, root_dir=None, img_size=None, transform=None):
-        captured["vin_manifest"] = manifest_csv
-        frame = pd.read_csv(manifest_csv, dtype={"image_id": str})
-        return _Cohort(frame["image_id"], frame["label"])
-
-    def fake_ptx(img_size=None, transform=None):
-        return _Cohort(["ptx_one"], [1])
-
-    monkeypatch.setattr(evaluate_kfold, "VinDataset", fake_vin)
-    monkeypatch.setattr(evaluate_kfold, "OODTestDataset", fake_ptx)
-
-    evaluate_kfold.fetch_results_per_resolution(
-        IMG_SIZE,
-        MODEL_NAME,
-        "ood_clean",
-        e5_manifest=str(root / CLEAN_NAME),
+    message = str(exc_info.value)
+    assert removed_mode not in message
+    for retained_mode in ("holdout", "vindr_test", "vindr_wide", "chexlocalize"):
+        assert retained_mode in message
+    assert evaluate_kfold.VALIDATION_MODES == (
+        "holdout",
+        "vindr_test",
+        "vindr_wide",
+        "chexlocalize",
     )
-
-    assert captured["vin_manifest"] == str(root / CLEAN_NAME)
-    ids_csv = (
-        home
-        / "output"
-        / "classif_preds"
-        / f"ood_cleanpred_{MODEL_NAME}_{IMG_SIZE}_ids.csv"
-    )
-    frame = pd.read_csv(ids_csv, dtype={"image_id": str})
-    assert list(frame["image_id"]) == E5_CLEAN["image_id"].tolist() + ["ptx_one"]
-    assert list(frame["source"]) == ["vindr"] * 3 + ["ptx498"]
-    assert list(frame["label"]) == [0, 1, 0, 1]
+    assert not (tmp_path / "home" / "output").exists()
 
 
 # --------------------------------------------------------------- E2 / E4 evaluation

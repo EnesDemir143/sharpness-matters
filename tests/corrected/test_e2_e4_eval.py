@@ -636,3 +636,17 @@ def test_cli_help_lists_e2_e4_modes():
     assert "vindr_test" in result.output
     assert "vindr_wide" in result.output
     assert "chexlocalize" in result.output
+
+
+def test_cli_no_longer_accepts_e5_evaluation():
+    # B does not evaluate E5 (25 Kasım 2026 decision); run A owns that row.
+    help_result = CliRunner().invoke(evaluate_kfold.main, ["--help"])
+    assert help_result.exit_code == 0
+    assert "--e5_manifest" not in help_result.output
+    assert "ood_reference_like" not in help_result.output
+    assert "ood_clean" not in help_result.output
+
+    rejected = CliRunner().invoke(
+        evaluate_kfold.main, ["--validation_mode", "ood_reference_like"]
+    )
+    assert rejected.exit_code != 0
