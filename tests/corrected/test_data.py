@@ -776,6 +776,15 @@ def test_siim_masked_loader_negative_row_has_empty_mask(tmp_path, monkeypatch):
 # -------------------------------------------------------------------- PTX-498
 
 
+def write_ptx498_cohort(path, rows):
+    """Freeze a synthetic PTX-498 cohort manifest (``image_id,site,case``)."""
+    frame = pd.DataFrame(rows, columns=["image_id", "site", "case"])
+    load_or_create_frozen(
+        Path(path), lambda: frame, {"item": "synthetic PTX-498 cohort"}
+    )
+    return Path(path)
+
+
 def test_ptx498_mask_is_native_binary_and_oriented_like_the_image(tmp_path, monkeypatch):
     root = tmp_path / "ptx498"
     for site in ["A", "B", "C"]:
@@ -783,6 +792,10 @@ def test_ptx498_mask_is_native_binary_and_oriented_like_the_image(tmp_path, monk
         site_dir.mkdir(parents=True)
         (site_dir / "1.4.img.nii.gz").write_bytes(b"")
         (site_dir / "1.5.mask.nii.gz").write_bytes(b"")
+    manifest = write_ptx498_cohort(
+        tmp_path / "ptx498_cohort.csv",
+        [("A_1", "A", "1"), ("B_1", "B", "1"), ("C_1", "C", "1")],
+    )
 
     image = np.linspace(0.0, 1.0, 16, dtype=np.float64).reshape(4, 4)
     mask = np.zeros((4, 4), dtype=np.float64)
@@ -792,7 +805,9 @@ def test_ptx498_mask_is_native_binary_and_oriented_like_the_image(tmp_path, monk
         return FakeNifti(mask if str(path).endswith("5.mask.nii.gz") else image)
 
     monkeypatch.setattr(ptx498.nib, "load", fake_load)
-    dataset = ptx498.OODTestDataset(root_dir=str(root), img_size=2)
+    dataset = ptx498.OODTestDataset(
+        root_dir=str(root), img_size=2, manifest_csv=manifest
+    )
     index = dataset.image_ids.index("A_1")
     item = dataset[index]
 
@@ -817,6 +832,10 @@ def test_ptx498_orientation_is_rot90_plus_horizontal_flip(tmp_path, monkeypatch)
         site_dir.mkdir(parents=True)
         (site_dir / "1.4.img.nii.gz").write_bytes(b"")
         (site_dir / "1.5.mask.nii.gz").write_bytes(b"")
+    manifest = write_ptx498_cohort(
+        tmp_path / "ptx498_cohort.csv",
+        [("A_1", "A", "1"), ("B_1", "B", "1"), ("C_1", "C", "1")],
+    )
 
     # Non-square raw arrays with a marker in one corner: square grids and axis-0 flips
     # would both slip through a looser comparison.
@@ -842,6 +861,7 @@ def test_ptx498_orientation_is_rot90_plus_horizontal_flip(tmp_path, monkeypatch)
         root_dir=str(root),
         img_size=8,
         transform=transforms.Compose([transforms.ToTensor()]),
+        manifest_csv=manifest,
     )
     item = dataset[dataset.image_ids.index("A_1")]
 
@@ -863,26 +883,37 @@ def test_ptx498_orientation_is_rot90_plus_horizontal_flip(tmp_path, monkeypatch)
 
 
 def test_ptx498_image_id_order_is_deterministic(tmp_path, monkeypatch):
+    """The frozen manifest fixes the order; filesystem listing cannot change it."""
     root = tmp_path / "ptx498"
     for site in ["A", "B", "C"]:
         site_dir = root / f"Site{site}"
         site_dir.mkdir(parents=True)
         for number in [3, 1, 2]:  # creation order must not matter
             (site_dir / f"{number}.4.img.nii.gz").write_bytes(b"")
+            (site_dir / f"{number}.5.mask.nii.gz").write_bytes(b"")
+    numbers = ["1", "2", "3"]
+    manifest = write_ptx498_cohort(
+        tmp_path / "ptx498_cohort.csv",
+        [(f"{site}_{number}", site, number) for site in "ABC" for number in numbers],
+    )
 
-    dataset = ptx498.OODTestDataset(root_dir=str(root), img_size=8)
-    expected = [f"{site}_{number}" for site in "ABC" for number in ["1", "2", "3"]]
+    dataset = ptx498.OODTestDataset(
+        root_dir=str(root), img_size=8, manifest_csv=manifest
+    )
+    expected = [f"{site}_{number}" for site in "ABC" for number in numbers]
     assert dataset.image_ids == expected
 
     # Reversing the directory listing must not change the order (PYTHONHASHSEED and
-    # filesystem order are both out of the picture).
+    # filesystem order are both out of the picture: the cohort is the manifest).
     real_listdir = os.listdir
 
     def reversed_listdir(path):
         return list(reversed(real_listdir(path)))
 
     monkeypatch.setattr(ptx498.os, "listdir", reversed_listdir)
-    reordered = ptx498.OODTestDataset(root_dir=str(root), img_size=8)
+    reordered = ptx498.OODTestDataset(
+        root_dir=str(root), img_size=8, manifest_csv=manifest
+    )
     assert reordered.image_ids == dataset.image_ids == expected
 
 

@@ -127,6 +127,11 @@ uv run python -m sharpness_matters.ptx.corrected.make_siim_holdout
 
 `manifests/siim_holdout.csv` (`image_id,label`, 1068 images / 238 positive for the author split) is frozen with `.sha256` and `.record.json`; it records both the `siim_folds.csv` SHA-256 it was derived from and its own CSV SHA-256. Evaluation loads it by membership (CSV row order cannot change the cohort) and fails closed if it overlaps the development manifest bound to the run's `cv_record.json`, if that provenance is absent or mismatched, if the creation record lacks its `csv_sha256`, or if the holdout is not exactly the development complement. Training verifies that the fold frame it trains on equals the hashed file and records `fold_manifest_provenance_version` next to `fold_manifest_sha256`; older records (no version) are unverifiable and cannot evaluate the holdout.
 
+**2b. PTX-498 cohort (E3/E5):** freezes `manifests/ptx498_cohort.csv` (`image_id,site,case`, 498 cases: 247+179+72) or verifies it if it already exists; the builder rejects a root whose SiteA/B/C case sets differ from the reference before anything is written.
+```bash
+uv run python -m sharpness_matters.ptx.corrected.make_ptx498_manifest
+```
+
 **3. Reference-like E5:** runs the unmodified author script `create_vin_dr_subset.py` once (fixed `PYTHONHASHSEED`) and freezes `manifests/reference_like_combined.csv`, both lists and `N_dup`.
 ```bash
 uv run python -m sharpness_matters.ptx.corrected.make_e5 reference

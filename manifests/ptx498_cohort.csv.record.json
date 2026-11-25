@@ -1,0 +1,31 @@
+{
+  "PYTHONHASHSEED": null,
+  "created_utc": "2026-11-24T20:12:50.172100+00:00",
+  "csv": "manifests/ptx498_cohort.csv",
+  "csv_sha256": "8384c51a6992cfd28a22f4d4f230902bf83a3fa2daae91591886de6cc36e8996",
+  "item": "PTX-498 external test cohort (E3/E5), frozen by case",
+  "n_cases": 498,
+  "numpy_version": "1.24.4",
+  "order": "SiteA, SiteB, SiteC; case number compared as a string (lexicographic)",
+  "pandas_version": "2.0.3",
+  "per_site_counts": {
+    "A": 247,
+    "B": 179,
+    "C": 72
+  },
+  "python_executable": "/home/furkan/Projects/bitirme_tezi/kod/referans_makale_kod/sharpness-matters/.venv/bin/python",
+  "python_version": "3.8.20",
+  "reference_cases": {
+    "A": "1..247",
+    "B": "1..179",
+    "C": "1..72"
+  },
+  "required_files": [
+    ".4.img.nii.gz",
+    ".5.mask.nii.gz"
+  ],
+  "root_dir": "/home/furkan/Projects/bitirme_tezi/kod/bizim_kod/datasets/AP-20261124T092159Z-1-003/AP/PTX-498-v2-fix",
+  "source_archive": "PTX-498-v2-fix.zip",
+  "source_record": "Zenodo record 8266529, release PTX-498-v2-fix",
+  "torch_version": "2.1.0+cu121"
+}

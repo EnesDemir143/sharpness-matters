@@ -14,10 +14,119 @@ from typing import Dict, Any, Tuple, Union, List, Optional
 
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
 from sharpness_matters.ptx.corrected.preprocess import eval_transform, minmax_per_image
+from sharpness_matters.ptx.corrected.frozen import load_frozen, manifest_dir
 from sharpness_matters.config.load_config import cfg
 
 HOME = Path(__file__).resolve().parent.parent
 logger = initialize_logger(level="info")
+
+COHORT_MANIFEST_NAME = "ptx498_cohort.csv"
+SITES = ("A", "B", "C")
+IMAGE_SUFFIX = ".4.img.nii.gz"
+MASK_SUFFIX = ".5.mask.nii.gz"
+_MAX_EXAMPLES = 5
+
+
+def default_cohort_manifest() -> Path:
+    """Frozen PTX-498 cohort manifest: ``manifests/ptx498_cohort.csv``."""
+    return manifest_dir() / COHORT_MANIFEST_NAME
+
+
+def _examples(items: List[str]) -> str:
+    """Up to five example values, with the remainder counted."""
+    shown = items[:_MAX_EXAMPLES]
+    text = ", ".join(shown)
+    if len(items) > _MAX_EXAMPLES:
+        text += f", ... ({len(items) - _MAX_EXAMPLES} more)"
+    return text
+
+
+def verify_cohort_files(
+    root_dir: Union[str, Path], image_ids: List[str]
+) -> None:
+    """Require the directory to hold exactly the frozen cohort's NIfTI pairs.
+
+    Every manifest ID must have both ``N.4.img.nii.gz`` and ``N.5.mask.nii.gz`` under
+    ``Site<site>``; a case present on disk but absent from the manifest, a missing or
+    empty site directory, or an unknown site in the manifest fails the run.
+
+    # B (PTX-18 / Section 7.3, follow-up): the cohort was ``os.listdir`` of SiteA/B/C,
+    #   so an existing but EMPTY SiteC/ gave 426 IDs (247+179+0) instead of 498, and a
+    #   case with only PNGs was accepted at parse time. New: the frozen manifest is
+    #   the cohort and this check proves the directory matches it, before
+    #   ``image_ids`` is published.
+    #   check: tests/corrected/test_ptx498_cohort.py
+    """
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise RuntimeError(
+            f"PTX-498 root directory {root} does not exist; the frozen cohort "
+            f"({len(image_ids)} cases) cannot be located"
+        )
+
+    expected: Dict[str, List[str]] = {}
+    for image_id in image_ids:
+        site, case = image_id.split("_", 1)
+        expected.setdefault(site, []).append(case)
+
+    issues: List[str] = []
+    unknown_sites = sorted(set(expected) - set(SITES))
+    if unknown_sites:
+        issues.append(
+            f"the frozen manifest names site(s) {unknown_sites}; expected {list(SITES)}"
+        )
+
+    for site in SITES:
+        cases = expected.get(site, [])
+        site_ids = [f"{site}_{case}" for case in cases]
+        site_dir = root / f"Site{site}"
+        if not site_dir.is_dir():
+            issues.append(
+                f"Site{site} directory is missing under {root}; the frozen manifest "
+                f"expects {len(cases)} case(s)"
+                + (f" (e.g. {_examples(site_ids)})" if cases else "")
+            )
+            continue
+        entries = sorted(entry.name for entry in site_dir.iterdir())
+        if not entries:
+            issues.append(
+                f"Site{site} directory {site_dir} is empty; the frozen manifest "
+                f"expects {len(cases)} case(s)"
+                + (f" (missing IDs e.g. {_examples(site_ids)})" if cases else "")
+            )
+            continue
+        missing = []
+        for case in cases:
+            absent = [
+                suffix
+                for suffix in (IMAGE_SUFFIX, MASK_SUFFIX)
+                if not (site_dir / f"{case}{suffix}").is_file()
+            ]
+            if absent:
+                missing.append(f"{site}_{case} (missing {', '.join(absent)})")
+        if missing:
+            issues.append(
+                f"Site{site}: {len(missing)} frozen case(s) lack their NIfTI files "
+                f"(e.g. {_examples(missing)})"
+            )
+        present = {
+            name[: -len(suffix)]
+            for name in entries
+            for suffix in (IMAGE_SUFFIX, MASK_SUFFIX)
+            if name.endswith(suffix)
+        }
+        extra = sorted(present - set(cases))
+        if extra:
+            issues.append(
+                f"Site{site}: {len(extra)} case(s) on disk are not in the frozen "
+                f"manifest (e.g. {_examples([f'{site}_{case}' for case in extra])})"
+            )
+
+    if issues:
+        raise RuntimeError(
+            "PTX-498 cohort verification failed against the frozen manifest "
+            f"({len(image_ids)} cases, root {root}): " + "; ".join(issues)
+        )
 
 
 def orient_ptx498(tensor: torch.Tensor) -> torch.Tensor:
@@ -50,9 +159,10 @@ class OODTestDataset(Dataset):
         root_dir: str = cfg.ptx.ptx498.root_dir,
         img_size: int = 224,
         transform: Optional[Any] = None,
+        manifest_csv: Optional[Union[str, Path]] = None,
     ):
         """
-        Initialize PTX498 dataset.
+        Initialize PTX498 dataset from the frozen cohort manifest.
 
         # B (PTX-27 / Section 5.4): no dataset mean/std and no stats pickle; the
         #   image is scaled per image with min-max. # B (PTX-26 / Section 5.3): the
@@ -61,39 +171,34 @@ class OODTestDataset(Dataset):
         #   *255, uint8 {0,1}). # B (§9.1 / Y6): image and mask go through the same
         #   orientation helper (author rot90 + horizontal flip on the last axis); the
         #   author's rot90 alone mirrored left/right vs the dataset PNG.
-        #   check: tests/corrected/test_data.py::test_ptx498_*
+        # B (PTX-18 / Section 7.3, follow-up): the cohort is the frozen manifest, and
+        #   the directory must match it; a partial site cannot shrink the test set.
+        #   check: tests/corrected/test_data.py::test_ptx498_*,
+        #          tests/corrected/test_ptx498_cohort.py
 
         Args:
             root_dir (str): Root directory containing Site folders with NIfTI files
             img_size (int): Target image size for resizing
             transform (Optional[Any]): Explicit preprocessing; defaults to eval_transform
+            manifest_csv (Optional[Union[str, Path]]): Frozen cohort manifest
+                (image_id,site,case); defaults to manifests/ptx498_cohort.csv
         """
+        manifest_path = (
+            Path(manifest_csv) if manifest_csv is not None else default_cohort_manifest()
+        )
+        manifest = load_frozen(manifest_path)
+        if "image_id" not in manifest.columns:
+            raise RuntimeError(
+                f"frozen PTX-498 manifest {manifest_path} has no image_id column"
+            )
+        image_ids = [str(image_id) for image_id in manifest["image_id"]]
+        verify_cohort_files(root_dir, image_ids)
         self.root_dir = root_dir
         self.img_size = img_size
-        self.parse_images()
+        self.image_ids = image_ids
         self.transform = (
             transform if transform is not None else eval_transform(img_size)
         )
-
-    def parse_images(self) -> None:
-        """
-        Parse and collect image IDs from all sites in the dataset.
-        Populates self.image_ids with format 'Site_ID'.
-
-        # B (PTX-18 / Section 7.3, follow-up): `ids` was a `set`, so iteration order
-        #   (and therefore dataset order) depended on PYTHONHASHSEED; saliency chunk
-        #   files are written and scored in later runs. New: site order A, B, C fixed
-        #   and IDs sorted within each site, so the order depends only on file names.
-        #   check: tests/corrected/test_data.py::test_ptx498_image_id_order_is_deterministic
-        """
-        sites = ["A", "B", "C"]
-        self.image_ids = []
-        for site in sites:
-            site_dir = os.path.join(self.root_dir, f"Site{site}")
-            all_paths = os.listdir(site_dir)
-            ids = sorted({path.split(".")[0] for path in all_paths})
-            for id in ids:
-                self.image_ids.append(f"{site}_{id}")
 
     def visualize_segmentation(
         self,
