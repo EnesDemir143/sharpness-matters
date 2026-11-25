@@ -191,6 +191,23 @@ uv run python -m sharpness_matters.ptx.corrected.analysis lock plans/analysis_pl
 uv run python -m sharpness_matters.ptx.corrected.analysis run plans/analysis_plan.json --out-dir reports/analysis
 ```
 
+Classification inputs name their probability column per side: use `prob_column` when both CSVs use the same name, or `prob_column_a`/`prob_column_b` when they differ (for example the A branch's stage-1 `score` vs the B branch's `prob`). Both names are part of the locked plan, and a missing column raises instead of falling back to the other side.
+```json
+"inputs": {"a": ".../stage1_scores.csv", "b": ".../stage2_ids.csv",
+           "prob_column_a": "score", "prob_column_b": "prob", "label_column": "label"}
+```
+
+Every `saliency_paired` comparison also registers `p_method`, so the p-value is never SciPy's data-dependent `method="auto"`: `"approx"` is the explicit normal approximation (use it for large cohorts, e.g. n=498), `"permutation"` is the exhaustive 2^n sign-flip test on the tie-averaged signed ranks (small continuous cohorts, at most 20 non-zero differences, requires `"zero_method": "wilcox"`), and `"mcnemar_exact"` is the two-sided exact binomial on the discordant pairs of a binary 0/1 hit metric (`zero_method` is still required and recorded but not applied, since a zero difference is a concordant pair). A missing key, `"auto"`, `"exact"` or another value fails validation, and `p_method` on a `classification_auroc` comparison is rejected (DeLong is fixed by the plan).
+```json
+"zero_method": "wilcox", "p_method": "approx"
+```
+
+Comparisons whose cohort repeats patients (the CheXlocalize E4 cohorts: 720 images / 700 patients and 16 images / 15 patients) register `"uncertainty_unit": "patient"` plus `"patient_manifest"` in `inputs` — a frozen `image_id`/`patient_id` CSV with its `.sha256` and `.record.json`, loaded with `load_frozen`, so every aligned image must map to a non-empty patient or the run raises before writing anything. The estimate stays the pooled paired difference, but `classification_auroc` takes a cluster percentile bootstrap that resamples patients and keeps all images of each drawn patient; its p-value is still the image-level paired DeLong test, which cannot model the clustering, and the row says so with `p_clustering_aware: false`. `saliency_paired` at patient level collapses to one value per patient (the mean of that patient's `b - a`) and runs the registered `p_method` and bootstrap on those patient values, so `n` counts patients (`n_images` is also recorded) and `mcnemar_exact` is rejected there. Rows carry `n_patients`, `n_multi_image_patients`, `patient_manifest_sha256` and `p_clustering_aware`; image-unit rows leave the patient fields empty.
+```json
+"uncertainty_unit": "patient", "inputs": {"a": "...", "b": "...",
+  "patient_manifest": "manifests/chexlocalize_cls.csv"}
+```
+
 The author's `p_value_classification.py`, `p_value_saliency.py`, `train_sweep.py` and `compare_cv_tune.py` are not part of B.
 
 ## Citation

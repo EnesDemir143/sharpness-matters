@@ -18,18 +18,25 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import binomtest, wilcoxon
 from sklearn.metrics import roc_auc_score
 
 from sharpness_matters.ptx.corrected.analysis import (
     OUTPUT_COLUMNS,
+    SALIENCY_P_METHODS,
     align_by_id,
     benjamini_hochberg,
+    bootstrap_auroc_diff_ci,
+    bootstrap_auroc_diff_ci_clustered,
+    cluster_draw,
     delong_paired,
     lock_plan,
+    patient_blocks,
     plan_sha256,
     run_plan,
     validate_plan,
 )
+from sharpness_matters.ptx.corrected.frozen import load_or_create_frozen, sha256_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_PLAN = (
@@ -54,10 +61,36 @@ def write_saliency(path, ids, ious, threshold=0.5, decisions=None):
     return path
 
 
-def write_classification(path, ids, labels, probs):
+def write_classification(path, ids, labels, probs, prob_column="prob"):
     pd.DataFrame(
-        {"image_id": list(ids), "label": list(labels), "prob": list(probs)}
+        {"image_id": list(ids), "label": list(labels), prob_column: list(probs)}
     ).to_csv(path, index=False)
+    return path
+
+
+def write_paired_differences(tmp_path, differences, base=0.5):
+    """Write `a.csv`/`b.csv` whose `b - a` is exactly `differences` after the CSV round trip.
+
+    `base` and every difference are exact binary fractions, so the registered test sees
+    the intended ties and zeros and not a floating-point near-tie.
+    """
+    differences = np.asarray(differences, dtype=float)
+    ids = [f"p{index:02d}" for index in range(differences.size)]
+    write_saliency(tmp_path / "a.csv", ids, [base] * differences.size)
+    write_saliency(tmp_path / "b.csv", ids, base + differences)
+    return ids
+
+
+def write_patient_manifest(path, image_ids, patient_ids):
+    """Freeze a synthetic `image_id` -> `patient_id` manifest (csv + .sha256 + record)."""
+    frame = pd.DataFrame(
+        {"image_id": list(image_ids), "patient_id": list(patient_ids)}
+    )
+    load_or_create_frozen(
+        Path(path),
+        lambda: frame,
+        {"description": "synthetic image_id -> patient_id map for the analysis tests"},
+    )
     return path
 
 
@@ -68,10 +101,13 @@ def saliency_comparison(
     metric_column="iou",
     threshold=0.5,
     zero_method="wilcox",
+    p_method="approx",
     endpoint_class="localization",
     where=None,
     n_boot=200,
     seed=7,
+    uncertainty_unit="image",
+    patient_manifest=None,
 ):
     comparison = {
         "id": comparison_id,
@@ -85,11 +121,15 @@ def saliency_comparison(
         },
         "cohort": {"where": {} if where is None else where},
         "paired_difference": "b - a",
-        "uncertainty_unit": "image",
+        "uncertainty_unit": uncertainty_unit,
         "bootstrap": {"n": n_boot, "seed": seed},
     }
+    if patient_manifest is not None:
+        comparison["inputs"]["patient_manifest"] = patient_manifest
     if zero_method is not None:
         comparison["zero_method"] = zero_method
+    if p_method is not None:
+        comparison["p_method"] = p_method
     return comparison
 
 
@@ -101,20 +141,26 @@ def classification_comparison(
     where=None,
     n_boot=200,
     seed=7,
+    prob_column="prob",
+    prob_columns=None,
+    uncertainty_unit="image",
+    patient_manifest=None,
 ):
+    inputs = {"a": a, "b": b, "label_column": "label"}
+    if prob_columns is None:
+        inputs["prob_column"] = prob_column
+    else:
+        inputs["prob_column_a"], inputs["prob_column_b"] = prob_columns
+    if patient_manifest is not None:
+        inputs["patient_manifest"] = patient_manifest
     return {
         "id": comparison_id,
         "kind": "classification_auroc",
         "endpoint_class": endpoint_class,
-        "inputs": {
-            "a": a,
-            "b": b,
-            "prob_column": "prob",
-            "label_column": "label",
-        },
+        "inputs": inputs,
         "cohort": {"where": {} if where is None else where},
         "paired_difference": "b - a",
-        "uncertainty_unit": "image",
+        "uncertainty_unit": uncertainty_unit,
         "bootstrap": {"n": n_boot, "seed": seed},
     }
 
@@ -161,8 +207,12 @@ def test_example_plan_validates():
     assert [item["name"] for item in plan["families"]] == [
         "siim_k1_localization_iou_t050",
         "siim_classification_auroc",
+        "chexlocalize_e4_localization_iou_patient",
+        "chexlocalize_e4_classification_auroc_patient",
     ]
     assert [item["endpoint_class"] for item in plan["families"]] == [
+        "localization",
+        "classification",
         "localization",
         "classification",
     ]
@@ -213,6 +263,78 @@ def test_classification_comparison_rejects_zero_method():
     comparison = classification_comparison("cmp")
     comparison["zero_method"] = "wilcox"
     with pytest.raises(ValueError, match="not applicable"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_saliency_comparison_requires_p_method():
+    comparison = saliency_comparison("cmp", p_method=None)
+    with pytest.raises(ValueError, match=r"p_method.*required for saliency_paired"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+@pytest.mark.parametrize("value", ["auto", "exact", "t_test"])
+def test_saliency_p_method_outside_registered_set_rejected(value):
+    comparison = saliency_comparison("cmp", p_method=value)
+    with pytest.raises(
+        ValueError, match=r"p_method.*must be one of.*'permutation'.*got"
+    ):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_classification_comparison_rejects_p_method():
+    comparison = classification_comparison("cmp")
+    comparison["p_method"] = "approx"
+    with pytest.raises(ValueError, match="not applicable"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_permutation_p_method_requires_wilcox_zero_method():
+    comparison = saliency_comparison("cmp", zero_method="pratt", p_method="permutation")
+    with pytest.raises(ValueError, match=r"permutation needs zero_method 'wilcox'"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_example_plan_registers_a_p_method_per_comparison():
+    plan = validate_plan(json.loads(EXAMPLE_PLAN.read_text(encoding="utf-8")))
+    comparisons = [
+        comparison
+        for registered_family in plan["families"]
+        for comparison in registered_family["comparisons"]
+    ]
+    saliency = [item for item in comparisons if item["kind"] == "saliency_paired"]
+    classification = [
+        item for item in comparisons if item["kind"] == "classification_auroc"
+    ]
+    assert saliency and classification
+    assert all(item["p_method"] in SALIENCY_P_METHODS for item in saliency)
+    # The example plan's two SIIM cohorts are large (>20 images): `approx`. The
+    # CheXlocalize XAI patient cohort has 15 patients, so the exhaustive sign-flip test
+    # is the registered one there.
+    assert {
+        item["p_method"]
+        for item in saliency
+        if item["uncertainty_unit"] == "image"
+    } == {"approx"}
+    assert {
+        item["p_method"]
+        for item in saliency
+        if item["uncertainty_unit"] == "patient"
+    } == {"permutation"}
+    # DeLong is the registered classification test; no p-value method is registered.
+    assert all(item["p_method"] is None for item in classification)
+
+
+def test_mixed_single_and_per_side_prob_columns_rejected():
+    comparison = classification_comparison("cmp", prob_columns=("score", "prob"))
+    comparison["inputs"]["prob_column"] = "prob"
+    with pytest.raises(ValueError, match="not both"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_per_side_prob_columns_must_be_complete():
+    comparison = classification_comparison("cmp", prob_columns=("score", "prob"))
+    del comparison["inputs"]["prob_column_b"]
+    with pytest.raises(ValueError, match=r"missing \['prob_column_b'\]"):
         validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
 
 
@@ -381,6 +503,206 @@ def test_registered_zero_method_is_used(tmp_path):
     assert wilcox_frame["statistic"].iloc[0] != pratt_frame["statistic"].iloc[0]
 
 
+# --------------------------------------------------------------------------- p-value method
+
+
+def run_saliency_plan(
+    tmp_path,
+    differences,
+    zero_method="wilcox",
+    p_method="permutation",
+    out="out",
+):
+    write_paired_differences(tmp_path, differences)
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [saliency_comparison("cmp", zero_method=zero_method, p_method=p_method)],
+            )
+        ],
+    )
+    run_plan(plan, tmp_path / out)
+    return read_outputs(tmp_path / out, "f")
+
+
+def test_permutation_matches_exhaustive_sign_flip_reference(tmp_path):
+    # 12 positive / 4 negative differences, all |b - a| equal (one tie group of 16):
+    # the conditional test counts 2 * (C(16,0)+..+C(16,4)) = 5034 of 2^16 sign patterns
+    # with |W+ - mean| >= |102 - 68| = 2 * P(Bin(16, .5) >= 12).
+    differences = [0.5] * 12 + [-0.5] * 4
+    frame, payload = run_saliency_plan(tmp_path, differences)
+    record = payload["comparisons"][0]
+
+    assert frame["p_raw"].iloc[0] == 0.076812744140625
+    assert frame["statistic"].iloc[0] == 34.0
+    assert record["p_method"] == "permutation"
+    assert record["n"] == 16 and record["n_zero_diffs"] == 0 and record["n_ties"] == 16
+    # SciPy 1.10.1 `method="exact"` applies a tie correction here (p = 0.0833): the
+    # registered test is the exhaustive sign-flip test, never scipy's default.
+    assert frame["p_raw"].iloc[0] != pytest.approx(
+        wilcoxon(differences, alternative="two-sided", method="exact").pvalue
+    )
+
+
+def test_permutation_drops_zero_differences_like_wilcox(tmp_path):
+    # 4 zero + 8(+1) + 4(-1) with the registered `wilcox` rule: n = 12 non-zero
+    # differences, ranks all tied at 6.5, W+ = 52 vs mean 39 -> 2 * (C(12,0)+..+C(12,4))
+    # = 1588 of 2^12 sign patterns are at least as extreme.
+    differences = [0.0] * 4 + [0.5] * 8 + [-0.5] * 4
+    frame, payload = run_saliency_plan(tmp_path, differences)
+    record = payload["comparisons"][0]
+
+    assert frame["p_raw"].iloc[0] == 0.3876953125
+    assert frame["statistic"].iloc[0] == 26.0
+    assert record["n"] == 16 and record["n_zero_diffs"] == 4
+    # Same counts, same two-sided binomial tail as the exact McNemar on 8 vs 4.
+    assert frame["p_raw"].iloc[0] == pytest.approx(binomtest(8, 12, 0.5).pvalue)
+
+
+def test_permutation_equals_scipy_exact_without_ties(tmp_path):
+    differences = (
+        np.array([1, -2, 3, 4, -5, 6, 7, -8, 9, 10, -11, 12, 13, -14, 15, 16]) / 64.0
+    )
+    assert np.unique(np.abs(differences)).size == differences.size
+    frame, payload = run_saliency_plan(tmp_path, differences)
+
+    expected = wilcoxon(differences, alternative="two-sided", method="exact")
+    # The JSON keeps full float precision; pandas' CSV reader may move the last bit.
+    assert payload["comparisons"][0]["p_raw"] == expected.pvalue
+    assert payload["comparisons"][0]["statistic"] == expected.statistic
+    assert frame["p_raw"].iloc[0] == pytest.approx(expected.pvalue, abs=1e-12)
+
+
+def test_permutation_rejects_cohort_above_the_limit(tmp_path):
+    differences = [0.5] * 11 + [-0.5] * 10
+    write_paired_differences(tmp_path, differences)
+    plan = locked_plan(
+        tmp_path, [family("f", [saliency_comparison("cmp", p_method="permutation")])]
+    )
+    with pytest.raises(RuntimeError, match="use p_method 'approx' for large cohorts"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_approx_path_is_the_explicit_normal_approximation(tmp_path):
+    # The same tied 12/4 vector: `auto` (and `exact`) report 0.0833 on SciPy 1.10.1,
+    # the registered `approx` method reports the normal approximation 0.0455.
+    differences = [0.5] * 12 + [-0.5] * 4
+    frame, payload = run_saliency_plan(tmp_path, differences, p_method="approx")
+    record = payload["comparisons"][0]
+
+    expected = wilcoxon(
+        differences, zero_method="wilcox", alternative="two-sided", method="approx"
+    )
+    # The JSON keeps full float precision; pandas' CSV reader may move the last bit.
+    assert record["p_raw"] == expected.pvalue
+    assert record["statistic"] == expected.statistic
+    assert frame["p_raw"].iloc[0] == pytest.approx(0.04550026389635839, abs=1e-12)
+    assert frame["p_raw"].iloc[0] < 0.05  # never the 0.0833 `auto`/`exact` value
+    assert record["p_method"] == "approx"
+
+
+def test_mcnemar_exact_counts_only_discordant_pairs(tmp_path):
+    # Binary hit, 16 images: b = 5 hits gained, c = 1 hit lost, 10 concordant pairs.
+    ids = [f"p{index:02d}" for index in range(16)]
+    values_a = np.zeros(16)
+    values_b = np.zeros(16)
+    values_a[5] = 1.0
+    values_b[:5] = 1.0
+    write_saliency(tmp_path / "a.csv", ids, values_a)
+    write_saliency(tmp_path / "b.csv", ids, values_b)
+    plan = locked_plan(
+        tmp_path,
+        [family("f", [saliency_comparison("cmp", p_method="mcnemar_exact")])],
+    )
+    run_plan(plan, tmp_path / "out")
+    frame, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+
+    # min(b, c) = 1 of 6 discordant pairs: 2 * P(Bin(6, .5) <= 1) = 14/64.
+    assert frame["p_raw"].iloc[0] == 0.21875
+    assert frame["statistic"].iloc[0] == 1.0
+    assert frame["estimate"].iloc[0] == pytest.approx(4.0 / 16.0)
+    # A zero difference is a concordant pair: `zero_method` is required by the kind but
+    # not used by this test, and the 10 zeros are the concordant pairs.
+    assert record["n"] == 16 and record["n_zero_diffs"] == 10
+    assert record["zero_method"] == "wilcox"
+    assert record["p_method"] == "mcnemar_exact"
+    assert record["degenerate"] is False
+
+
+def test_mcnemar_exact_all_concordant_pairs_is_degenerate(tmp_path):
+    # Binary hits that agree on every image: no discordant pair, so p = 1 by definition.
+    ids = [f"i{index:02d}" for index in range(12)]
+    hits = [index % 2 for index in range(12)]
+    write_saliency(tmp_path / "a.csv", ids, hits)
+    write_saliency(tmp_path / "b.csv", ids, hits)
+    plan = locked_plan(
+        tmp_path,
+        [family("f", [saliency_comparison("cmp", p_method="mcnemar_exact")])],
+    )
+    run_plan(plan, tmp_path / "out")
+    frame, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+    assert frame["p_raw"].iloc[0] == 1.0
+    assert frame["statistic"].iloc[0] == 0.0
+    assert record["degenerate"] is True
+
+
+def test_approx_all_zero_differences_is_degenerate(tmp_path):
+    frame, payload = run_saliency_plan(tmp_path, [0.0] * 12, p_method="approx")
+    record = payload["comparisons"][0]
+    assert frame["p_raw"].iloc[0] == 1.0
+    assert frame["statistic"].iloc[0] == 0.0
+    assert record["degenerate"] is True
+
+
+def test_mcnemar_exact_rejects_non_binary_values(tmp_path):
+    ids = ["i1", "i2", "i3"]
+    write_saliency(tmp_path / "a.csv", ids, [0.0, 0.0, 0.0])
+    write_saliency(tmp_path / "b.csv", ids, [1.0, 0.0, 0.5])
+    plan = locked_plan(
+        tmp_path,
+        [family("f", [saliency_comparison("cmp", p_method="mcnemar_exact")])],
+    )
+    with pytest.raises(RuntimeError, match=r"binary.*found 0\.5 in input b"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_mcnemar_exact_rejects_a_constant_non_binary_metric(tmp_path):
+    # Constant 0.5 on both sides has only concordant (zero) differences; the binary
+    # requirement is still checked instead of reporting the degenerate p = 1.
+    ids = ["i1", "i2", "i3"]
+    write_saliency(tmp_path / "a.csv", ids, [0.5, 0.5, 0.5])
+    write_saliency(tmp_path / "b.csv", ids, [0.5, 0.5, 0.5])
+    plan = locked_plan(
+        tmp_path,
+        [family("f", [saliency_comparison("cmp", p_method="mcnemar_exact")])],
+    )
+    with pytest.raises(RuntimeError, match=r"binary.*found 0\.5 in input a"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_output_rows_and_json_record_the_registered_p_method(tmp_path):
+    differences = [0.5] * 12 + [-0.5] * 4
+    frame, payload = run_saliency_plan(tmp_path, differences)
+    record = payload["comparisons"][0]
+
+    assert "p_method" in OUTPUT_COLUMNS
+    assert list(frame.columns) == OUTPUT_COLUMNS
+    assert frame["p_method"].tolist() == ["permutation"]
+    for key in ("n", "n_zero_diffs", "n_ties", "tie_quantity", "p_method"):
+        assert key in record
+    assert record["tie_quantity"] == "|b - a| (non-zero)"
+
+
+# --------------------------------------------------------------------------- row order
+
+
 def test_row_order_does_not_change_results_and_hash_is_stamped(tmp_path):
     rng = np.random.default_rng(3)
     ids = [f"img{index:03d}" for index in range(24)]
@@ -477,6 +799,68 @@ def test_classification_auroc_difference_and_delong(tmp_path):
     assert 0.0 <= frame["p_raw"].iloc[0] <= 1.0
     assert frame["statistic"].iloc[0] >= 0.0
     assert frame["n"].iloc[0] == labels.size
+    # The single `prob_column` contract resolves to the same column on both sides.
+    assert record["inputs"]["prob_column_a"] == "prob"
+    assert record["inputs"]["prob_column_b"] == "prob"
+
+
+def test_classification_compares_a_score_to_b_prob(tmp_path):
+    rng = np.random.default_rng(23)
+    ids = [f"c{index:03d}" for index in range(40)]
+    labels = np.array([0, 1] * 20)
+    scores_a = np.clip(
+        0.40 + 0.20 * labels + rng.normal(0, 0.08, labels.size), 0.01, 0.99
+    )
+    probs_b = np.clip(
+        0.45 + 0.32 * labels + rng.normal(0, 0.08, labels.size), 0.01, 0.99
+    )
+    # A's stage-1 CSV is keyed by image_id but carries `score` and a shuffled row order;
+    # alignment must use IDs, and each side must read its own registered column.
+    order = rng.permutation(len(ids))
+    write_classification(
+        tmp_path / "a.csv",
+        [ids[index] for index in order],
+        labels[order],
+        scores_a[order],
+        prob_column="score",
+    )
+    write_classification(tmp_path / "b.csv", ids, labels, probs_b)
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [classification_comparison("cmp", prob_columns=("score", "prob"))],
+            )
+        ],
+    )
+    run_plan(plan, tmp_path / "out")
+    frame, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+
+    expected = roc_auc_score(labels, probs_b) - roc_auc_score(labels, scores_a)
+    assert frame["estimate"].iloc[0] == pytest.approx(expected, abs=1e-12)
+    assert record["n"] == labels.size
+    assert record["inputs"]["prob_column_a"] == "score"
+    assert record["inputs"]["prob_column_b"] == "prob"
+
+
+def test_classification_missing_registered_prob_column_raises(tmp_path):
+    _classification_inputs(tmp_path)
+    # Both CSVs carry `prob`, but the plan names A's column `score`: never guess or fall
+    # back to B's column name.
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [classification_comparison("cmp", prob_columns=("score", "prob"))],
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="column 'score' missing from input a"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
 
 
 def test_classification_label_mismatch_raises(tmp_path):
@@ -541,3 +925,396 @@ def test_delong_normal_case_is_unchanged():
     assert degenerate is False
     assert np.isfinite(statistic) and statistic > 0.0
     assert 0.0 < p_value < 1.0
+
+
+# --------------------------------------------------------------------------- patient unit
+
+
+def _repeated_patient_frame():
+    """20 patients x 2 images; both images of a patient share its label and its scores.
+
+    The 40 rows therefore carry 20 independent observations: an image-level bootstrap
+    understates the uncertainty that a patient-level cluster bootstrap keeps.
+    """
+    rng = np.random.default_rng(13)
+    labels = np.repeat(np.array([0, 1] * 10), 2)
+    probs_a = np.repeat(np.clip(rng.uniform(0.20, 0.50, 20), 0.01, 0.99), 2)
+    probs_b = np.repeat(np.clip(rng.uniform(0.40, 0.90, 20), 0.01, 0.99), 2)
+    patient_ids = np.repeat([f"p{index:02d}" for index in range(20)], 2)
+    return labels, probs_a, probs_b, patient_ids
+
+
+def _patient_classification_inputs(tmp_path):
+    labels, probs_a, probs_b, patient_ids = _repeated_patient_frame()
+    ids = [f"c{index:02d}" for index in range(40)]
+    write_classification(tmp_path / "a.csv", ids, labels, probs_a)
+    write_classification(tmp_path / "b.csv", ids, labels, probs_b)
+    return ids, patient_ids
+
+
+def test_patient_unit_requires_patient_manifest():
+    comparison = saliency_comparison("cmp", uncertainty_unit="patient")
+    with pytest.raises(ValueError, match=r"missing key\(s\) \['patient_manifest'\]"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_image_unit_rejects_patient_manifest():
+    comparison = classification_comparison("cmp", patient_manifest="patients.csv")
+    with pytest.raises(ValueError, match="patient_manifest is registered only with"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_patient_unit_rejects_mcnemar_exact():
+    comparison = saliency_comparison(
+        "cmp",
+        p_method="mcnemar_exact",
+        uncertainty_unit="patient",
+        patient_manifest="patients.csv",
+    )
+    with pytest.raises(ValueError, match="mcnemar_exact"):
+        validate_plan({"plan_version": 1, "families": [family("f", [comparison])]})
+
+
+def test_patient_manifest_hash_mismatch_raises_and_writes_nothing(tmp_path):
+    ids, patient_ids = _patient_classification_inputs(tmp_path)
+    manifest = write_patient_manifest(tmp_path / "patients.csv", ids, patient_ids)
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [
+                    classification_comparison(
+                        "cmp",
+                        uncertainty_unit="patient",
+                        patient_manifest="patients.csv",
+                    )
+                ],
+            )
+        ],
+    )
+    # A frozen manifest is never reloaded after a byte changed.
+    with open(manifest, "a", encoding="utf-8") as handle:
+        handle.write("\n")
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_patient_manifest_requires_image_and_patient_columns(tmp_path):
+    write_saliency(tmp_path / "a.csv", ["i1", "i2"], [0.2, 0.3])
+    write_saliency(tmp_path / "b.csv", ["i1", "i2"], [0.25, 0.35])
+    load_or_create_frozen(
+        tmp_path / "patients.csv",
+        lambda: pd.DataFrame({"image_id": ["i1", "i2"]}),
+        {"description": "manifest without patient_id"},
+    )
+    comparison = saliency_comparison(
+        "cmp",
+        uncertainty_unit="patient",
+        patient_manifest="patients.csv",
+        p_method="permutation",
+    )
+    plan = locked_plan(tmp_path, [family("f", [comparison])])
+    with pytest.raises(RuntimeError, match=r"missing column\(s\) \['patient_id'\]"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_patient_manifest_rejects_duplicate_image_ids(tmp_path):
+    ids, patient_ids = _patient_classification_inputs(tmp_path)
+    duplicate = ids + [ids[0]]
+    load_or_create_frozen(
+        tmp_path / "patients.csv",
+        lambda: pd.DataFrame(
+            {"image_id": duplicate, "patient_id": list(patient_ids) + ["p00"]}
+        ),
+        {"description": "manifest with a duplicated image_id"},
+    )
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [
+                    classification_comparison(
+                        "cmp",
+                        uncertainty_unit="patient",
+                        patient_manifest="patients.csv",
+                    )
+                ],
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="duplicated image_id"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_patient_manifest_rejects_empty_patient_id(tmp_path):
+    ids, patient_ids = _patient_classification_inputs(tmp_path)
+    empty = np.asarray(patient_ids, dtype=object).copy()
+    empty[3] = ""
+    write_patient_manifest(tmp_path / "patients.csv", ids, empty)
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [
+                    classification_comparison(
+                        "cmp",
+                        uncertainty_unit="patient",
+                        patient_manifest="patients.csv",
+                    )
+                ],
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="empty patient_id"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_unmapped_aligned_image_raises_and_writes_nothing(tmp_path):
+    ids, patient_ids = _patient_classification_inputs(tmp_path)
+    # The manifest covers the cohort except the last image: every aligned image must map.
+    write_patient_manifest(
+        tmp_path / "patients.csv", ids[:-1], patient_ids[:-1]
+    )
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [
+                    classification_comparison(
+                        "cmp",
+                        uncertainty_unit="patient",
+                        patient_manifest="patients.csv",
+                    )
+                ],
+            )
+        ],
+    )
+    with pytest.raises(RuntimeError, match="no patient_id in the frozen manifest"):
+        run_plan(plan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def _draw_segments(draw, blocks):
+    """Split a cluster draw into its whole-patient blocks, in draw order."""
+    segments = []
+    position = 0
+    while position < draw.size:
+        for block in blocks:
+            end = position + block.size
+            if end <= draw.size and np.array_equal(draw[position:end], block):
+                segments.append(block)
+                position = end
+                break
+        else:
+            raise AssertionError(f"draw is not a concatenation of patient blocks: {draw}")
+    return segments
+
+
+def test_cluster_draw_keeps_whole_patient_groups():
+    patient_ids = np.array(["p1", "p1", "p2", "p3", "p3", "p3", "p4"])
+    blocks = patient_blocks(patient_ids)
+    assert [list(block) for block in blocks] == [[0, 1], [2], [3, 4, 5], [6]]
+
+    rng = np.random.default_rng(0)
+    for _ in range(25):
+        draw = cluster_draw(blocks, rng)
+        segments = _draw_segments(draw, blocks)
+        # Exactly n_patients clusters are resampled, each one a whole patient: no image
+        # of a drawn patient is ever dropped, so within-patient dependence survives.
+        assert len(segments) == len(blocks)
+        assert np.array_equal(np.concatenate(segments), draw)
+        for block in segments:
+            assert len(set(patient_ids[block])) == 1
+
+
+def test_cluster_draw_is_reproducible_from_the_registered_seed():
+    patient_ids = np.array(["p1", "p1", "p2", "p2", "p3", "p4", "p4"])
+    blocks = patient_blocks(patient_ids)
+    first = [cluster_draw(blocks, np.random.default_rng(3)) for _ in range(4)]
+    second = [cluster_draw(blocks, np.random.default_rng(3)) for _ in range(4)]
+    for draw_a, draw_b in zip(first, second):
+        assert np.array_equal(draw_a, draw_b)
+        assert len(_draw_segments(draw_a, blocks)) == len(blocks)
+
+
+def test_cluster_bootstrap_ci_is_at_least_as_wide_as_image_bootstrap():
+    labels, probs_a, probs_b, patient_ids = _repeated_patient_frame()
+    image = bootstrap_auroc_diff_ci(labels, probs_a, probs_b, n_boot=400, seed=5)
+    cluster = bootstrap_auroc_diff_ci_clustered(
+        labels, probs_a, probs_b, patient_ids, n_boot=400, seed=5
+    )
+    image_width = image["ci_high"] - image["ci_low"]
+    cluster_width = cluster["ci_high"] - cluster["ci_low"]
+    # 40 rows carry 20 independent observations; resampling whole patients keeps that
+    # dependence, so the interval is never narrower than the independent-image one.
+    assert cluster_width >= image_width
+    assert cluster_width > 1.2 * image_width
+    assert cluster["n"] == 400 and cluster["n_used"] == 400
+    assert cluster["ci_low"] <= cluster["ci_high"]
+
+
+def test_classification_patient_unit_reports_cluster_fields(tmp_path):
+    ids, patient_ids = _patient_classification_inputs(tmp_path)
+    labels, probs_a, probs_b, _ = _repeated_patient_frame()
+    manifest = write_patient_manifest(tmp_path / "patients.csv", ids, patient_ids)
+    plan = locked_plan(
+        tmp_path,
+        [
+            family(
+                "f",
+                [
+                    classification_comparison(
+                        "cmp",
+                        uncertainty_unit="patient",
+                        patient_manifest="patients.csv",
+                        n_boot=300,
+                        seed=11,
+                    )
+                ],
+            )
+        ],
+    )
+    run_plan(plan, tmp_path / "out")
+    frame, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+
+    assert record["uncertainty_unit"] == "patient"
+    assert record["n"] == 40 and record["n_images"] == 40
+    assert record["n_patients"] == 20
+    assert record["n_multi_image_patients"] == 20
+    assert record["max_images_per_patient"] == 2
+    assert record["patient_manifest"] == str(manifest.resolve())
+    assert Path(record["patient_manifest"]).is_absolute()
+    assert record["inputs"]["patient_manifest"] == record["patient_manifest"]
+    digest = sha256_file(manifest)
+    assert record["patient_manifest_sha256"] == digest
+
+    # The pooled paired difference and the image-level paired DeLong p are unchanged:
+    # only the interval becomes a cluster bootstrap, and the record says the p-value
+    # does not model the clustering.
+    expected = roc_auc_score(labels, probs_b) - roc_auc_score(labels, probs_a)
+    assert record["estimate"] == pytest.approx(expected, abs=1e-12)
+    _, delong_p, _ = delong_paired(labels, probs_a, probs_b)
+    assert record["p_raw"] == delong_p
+    assert record["p_clustering_aware"] is False
+
+    for column in (
+        "uncertainty_unit",
+        "n_images",
+        "n_patients",
+        "n_multi_image_patients",
+        "patient_manifest_sha256",
+        "p_clustering_aware",
+    ):
+        assert column in OUTPUT_COLUMNS and column in frame.columns
+    assert frame["uncertainty_unit"].tolist() == ["patient"]
+    assert int(frame["n_images"].iloc[0]) == 40
+    assert int(frame["n_patients"].iloc[0]) == 20
+    assert int(frame["n_multi_image_patients"].iloc[0]) == 20
+    assert frame["patient_manifest_sha256"].tolist() == [digest]
+    assert frame["p_clustering_aware"].tolist() == [False]
+
+
+def test_patient_manifest_is_recorded_as_an_absolute_resolved_path(tmp_path, monkeypatch):
+    # Run the plan from inside its own directory with a relative plan path: the recorded
+    # manifest must still be the absolute file a reader can open, not "./patients.csv".
+    write_saliency(tmp_path / "a.csv", ["i1", "i2"], [0.2, 0.3])
+    write_saliency(tmp_path / "b.csv", ["i1", "i2"], [0.25, 0.35])
+    manifest = write_patient_manifest(tmp_path / "patients.csv", ["i1", "i2"], ["p1", "p1"])
+    comparison = saliency_comparison(
+        "cmp",
+        uncertainty_unit="patient",
+        patient_manifest="patients.csv",
+        p_method="permutation",
+    )
+    write_plan(tmp_path, [family("f", [comparison])])
+    monkeypatch.chdir(tmp_path)
+    lock_plan(Path("plan.json"))
+    run_plan(Path("plan.json"), Path("out"))
+
+    _, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+    assert record["patient_manifest"] == str(manifest.resolve())
+    assert record["n_patients"] == 1 and record["max_images_per_patient"] == 2
+
+
+def test_image_unit_rows_report_no_patient_fields(tmp_path):
+    _classification_inputs(tmp_path)
+    plan = locked_plan(tmp_path, [family("f", [classification_comparison("cmp")])])
+    run_plan(plan, tmp_path / "out")
+    frame, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+    assert record["uncertainty_unit"] == "image"
+    assert record["n_images"] == record["n"] == 40
+    assert record["n_patients"] is None
+    assert record["n_multi_image_patients"] is None
+    assert record["max_images_per_patient"] is None
+    assert record["patient_manifest"] is None
+    assert record["patient_manifest_sha256"] is None
+    assert record["p_clustering_aware"] is None
+    assert pd.isna(frame["n_patients"].iloc[0])
+    assert pd.isna(frame["p_clustering_aware"].iloc[0])
+
+
+def test_saliency_patient_collapse_uses_patient_mean_differences(tmp_path):
+    # Three patients, one with two images. Image differences: -0.5, +0.5 (patient p1,
+    # mean 0.0), +0.25 (p2), +0.25 (p3). The registered estimand is the mean of the
+    # patient-mean differences = (0.0 + 0.25 + 0.25) / 3 = 1/6, never the image mean
+    # (-0.5 + 0.5 + 0.25 + 0.25) / 4 = 0.125.
+    ids = ["i1", "i2", "i3", "i4"]
+    write_saliency(tmp_path / "a.csv", ids, [0.75, 0.25, 0.50, 0.50])
+    write_saliency(tmp_path / "b.csv", ids, [0.25, 0.75, 0.75, 0.75])
+    write_patient_manifest(tmp_path / "patients.csv", ids, ["p1", "p1", "p2", "p3"])
+    comparison = saliency_comparison(
+        "cmp",
+        uncertainty_unit="patient",
+        patient_manifest="patients.csv",
+        p_method="permutation",
+        n_boot=300,
+    )
+    plan = locked_plan(tmp_path, [family("f", [comparison])])
+    run_plan(plan, tmp_path / "out")
+    frame, payload = read_outputs(tmp_path / "out", "f")
+    record = payload["comparisons"][0]
+
+    assert record["n"] == 3 and record["n_images"] == 4
+    assert record["n_patients"] == 3
+    assert record["n_multi_image_patients"] == 1
+    assert record["max_images_per_patient"] == 2
+    assert record["estimate"] == pytest.approx(1.0 / 6.0)
+    assert record["estimate"] != pytest.approx(0.125)
+    # Patient-level signed ranks: the 0.0 patient difference is dropped (wilcox), the
+    # two 0.25 values tie at rank 1.5 -> 2 of the 4 sign patterns are at least as extreme.
+    assert record["p_raw"] == 0.5
+    assert record["statistic"] == 0.0
+    assert record["n_zero_diffs"] == 1
+    assert record["n_ties"] == 2
+    assert record["tie_quantity"] == "patient-mean |b - a| (non-zero)"
+    assert record["p_clustering_aware"] is True
+    assert record["ci_low"] <= record["estimate"] <= record["ci_high"]
+    assert frame["n"].iloc[0] == 3
+
+
+def test_example_plan_registers_a_patient_unit_comparison_per_kind():
+    plan = validate_plan(json.loads(EXAMPLE_PLAN.read_text(encoding="utf-8")))
+    comparisons = [
+        comparison
+        for registered_family in plan["families"]
+        for comparison in registered_family["comparisons"]
+    ]
+    patient = [item for item in comparisons if item["uncertainty_unit"] == "patient"]
+    assert {item["kind"] for item in patient} == {"saliency_paired", "classification_auroc"}
+    assert all(item["inputs"]["patient_manifest"].endswith(".csv") for item in patient)
+    assert all(
+        item["inputs"]["patient_manifest"] is None
+        for item in comparisons
+        if item["uncertainty_unit"] == "image"
+    )

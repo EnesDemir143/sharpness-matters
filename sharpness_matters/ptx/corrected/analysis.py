@@ -35,6 +35,53 @@
 #   before scoring.
 #   check: ::test_mixed_endpoint_classes_rejected,
 #   ::test_classification_auroc_requires_classification_endpoint
+# B (PTX-05 / Section 8.1): current -> every saliency p-value came from SciPy's implicit
+#   `wilcoxon(..., method="auto")`: exact below 50 pairs unless there are zeros, and the
+#   1.10.1 "exact" is not exact with tied |d|, so the same registered comparison flipped
+#   between 1.10.1 (tied 12+/4-, n=16: p=0.0833) and 1.15.1 (p=0.0455) and switched to
+#   the normal approximation on any zero difference. Problem -> a pre-registered p-value
+#   whose method depends on the data and the installed SciPy version is not registered,
+#   and a binary 0/1 hit difference is better tested on its discordant pairs. New ->
+#   every saliency_paired comparison registers `p_method` in {"permutation", "approx",
+#   "mcnemar_exact"}; `approx` calls `wilcoxon(method="approx")` explicitly (the
+#   registered normal approximation, ties breaching the exact distribution), `permutation`
+#   is the exhaustive 2^n sign-flip test on tie-averaged signed ranks (zeros dropped with
+#   `zero_method="wilcox"`, n_nonzero <= 20, deterministic, no seed) and `mcnemar_exact`
+#   is the two-sided exact binomial on the discordant binary pairs. The plan validation
+#   rejects `auto`, `exact` and a missing `p_method`; the choice is never made from the
+#   sample. The SciPy version stays in the run JSON (PTX-24).
+#   check: ::test_permutation_matches_exhaustive_sign_flip_reference,
+#   ::test_permutation_drops_zero_differences_like_wilcox,
+#   ::test_permutation_equals_scipy_exact_without_ties,
+#   ::test_permutation_rejects_cohort_above_the_limit,
+#   ::test_approx_path_is_the_explicit_normal_approximation,
+#   ::test_mcnemar_exact_counts_only_discordant_pairs,
+#   ::test_mcnemar_exact_rejects_non_binary_values
+# B (Section 11.2): current -> every bootstrap resampled images independently and
+#   `uncertainty_unit` accepted only "image", although the CheXlocalize E4 cohorts repeat
+#   patients (720 images / 700 patients; 16 images / 15 patients). Problem -> rows that
+#   share a patient are not independent, so an image-level interval is too narrow, and no
+#   output said which unit was resampled. New -> `uncertainty_unit` is registered per
+#   comparison ("image" | "patient"). A patient-unit comparison registers
+#   `inputs.patient_manifest`, a frozen `image_id`/`patient_id` manifest loaded with
+#   `load_frozen` (csv + .sha256 + .record.json, hash verified); every aligned image must
+#   map to a non-empty patient, and `n_patients`/`n_multi_image_patients`/
+#   `max_images_per_patient` are recorded. `classification_auroc` keeps the pooled
+#   estimate and the image-level paired DeLong p (recorded as `p_clustering_aware:
+#   false`, because DeLong cannot model clustering) and takes a cluster percentile
+#   bootstrap that resamples patients and keeps all images of each drawn patient.
+#   `saliency_paired` collapses to one value per patient (the mean `b - a` over that
+#   patient's images) and runs the registered `p_method` and the bootstrap on those
+#   patient values; `mcnemar_exact` has no patient-level binary outcome and is rejected.
+#   Image-unit rows record no patient fields and `p_clustering_aware: null`.
+#   check: ::test_patient_unit_requires_patient_manifest,
+#   ::test_image_unit_rejects_patient_manifest,
+#   ::test_patient_unit_rejects_mcnemar_exact,
+#   ::test_unmapped_aligned_image_raises_and_writes_nothing,
+#   ::test_cluster_draw_keeps_whole_patient_groups,
+#   ::test_cluster_bootstrap_ci_is_at_least_as_wide_as_image_bootstrap,
+#   ::test_classification_patient_unit_reports_cluster_fields,
+#   ::test_saliency_patient_collapse_uses_patient_mean_differences
 
 Plan schema (JSON, all keys validated; unknown keys are errors):
     {
@@ -55,16 +102,40 @@ Plan schema (JSON, all keys validated; unknown keys are errors):
                        "metric_column": str,
                        "threshold": {"column": str, "value": number},
                        # classification_auroc only, optional:
-                       "prob_column": "prob", "label_column": "label"},
+                       # one name for both sides:
+                       "prob_column": "prob",
+                       # or one name per side when the two CSVs differ
+                       # (e.g. the stage-1 CSV's `score` vs stage-2's `prob`):
+                       "prob_column_a": "score", "prob_column_b": "prob",
+                       "label_column": "label",
+                       # required if and only if uncertainty_unit is "patient":
+                       # frozen image_id/patient_id manifest (csv + .sha256 + record):
+                       "patient_manifest": path},
             "cohort": {"description": str,   # optional
                        "where": {column: value | [values]}},
             "paired_difference": "b - a",
             "zero_method": "wilcox" | "pratt" | "zsplit",  # saliency only, required
-            "uncertainty_unit": "image",
+            "p_method": "permutation" | "approx" | "mcnemar_exact",  # saliency only, required
+            "uncertainty_unit": "image" | "patient",
             "bootstrap": {"n": int, "seed": int}}
          ]}
       ]
     }
+
+`mcnemar_exact` needs binary 0/1 values on both sides and tests the discordant pairs; a
+zero difference is a concordant pair there, so the registered `zero_method` is recorded
+but not applied (it is still required because it defines the kind's zero rule).
+
+`uncertainty_unit` is the resampling unit. With `"patient"` the comparison also registers
+`patient_manifest`, every aligned `image_id` must map to a non-empty patient ID, the
+bootstrap resamples patients (all images of a drawn patient are kept), and the record
+carries `n_patients`, `n_multi_image_patients` and `max_images_per_patient`.
+`classification_auroc` keeps the pooled AUROC difference and the image-level paired
+DeLong p-value (DeLong cannot model clustering), recorded explicitly as
+`p_clustering_aware: false`; `saliency_paired` runs on one value per patient (the mean
+`b - a` over the patient's images), so its p-value is clustering-aware
+(`p_clustering_aware: true`) and its `n` counts patients. Image-unit rows have no patient
+identity and record `p_clustering_aware: null`.
 
 Relative input paths are resolved against the plan file's directory, so a plan and its
 inputs travel together. `lock_plan` writes `<plan>.sha256` (and validates first);
@@ -81,7 +152,7 @@ import re
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -89,11 +160,11 @@ import scipy
 import sklearn
 import statsmodels
 from MLstatkit.stats import Delong_test
-from scipy.stats import wilcoxon
+from scipy.stats import binomtest, rankdata, wilcoxon
 from sklearn.metrics import roc_auc_score
 from statsmodels.stats.multitest import multipletests
 
-from sharpness_matters.ptx.corrected.frozen import hash_path, sha256_file
+from sharpness_matters.ptx.corrected.frozen import hash_path, load_frozen, sha256_file
 
 PLAN_VERSION = 1
 CLASSIFICATION_ENDPOINT = "classification"
@@ -103,14 +174,18 @@ SALIENCY_KIND = "saliency_paired"
 CLASSIFICATION_KIND = "classification_auroc"
 KINDS = (SALIENCY_KIND, CLASSIFICATION_KIND)
 ZERO_METHODS = ("wilcox", "pratt", "zsplit")
+SALIENCY_P_METHODS = ("permutation", "approx", "mcnemar_exact")
+PERMUTATION_MAX_N = 20
 CORRECTION_METHODS = ("bh",)
 PAIRED_DIFFERENCE = "b - a"
-UNCERTAINTY_UNITS = ("image",)
+UNCERTAINTY_UNITS = ("image", "patient")
+PATIENT_UNIT = "patient"
 CI_LEVEL = 0.95
 _AUROC_EQUAL_ATOL = 1e-12
 OUTPUT_COLUMNS = [
     "comparison_id",
     "endpoint_class",
+    "p_method",
     "n",
     "estimate",
     "ci_low",
@@ -120,6 +195,12 @@ OUTPUT_COLUMNS = [
     "p_bh",
     "reject",
     "plan_sha256",
+    "uncertainty_unit",
+    "n_images",
+    "n_patients",
+    "n_multi_image_patients",
+    "patient_manifest_sha256",
+    "p_clustering_aware",
 ]
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -190,7 +271,43 @@ def _validate_cohort(cohort: Any, where: str) -> Dict[str, Any]:
     return {"description": description, "where": dict(where_map)}
 
 
-def _validate_inputs(inputs: Any, kind: str, where: str) -> Dict[str, Any]:
+def _validate_prob_columns(inputs: Dict[str, Any], where: str) -> Tuple[str, str]:
+    """Resolve the registered probability column for each side.
+
+    `prob_column` names one column used on both sides (the original contract).
+    `prob_column_a`/`prob_column_b` name each side explicitly, so an A-branch `score`
+    CSV and a B-branch `prob` CSV are compared without renaming or guessing. Mixing the
+    two forms, or registering only one per-side name, is an error.
+    """
+    single = "prob_column" in inputs
+    per_side = [name for name in ("prob_column_a", "prob_column_b") if name in inputs]
+    if single and per_side:
+        _fail(
+            where,
+            "set either prob_column (one column for both sides) or "
+            "prob_column_a + prob_column_b, not both",
+        )
+    if per_side and len(per_side) != 2:
+        missing = sorted({"prob_column_a", "prob_column_b"} - set(per_side))
+        _fail(
+            where,
+            f"per-side probability columns need both keys; missing {missing} "
+            "(one side is never allowed to fall back to the other's column)",
+        )
+    if single:
+        column = _as_text(inputs["prob_column"], f"{where}.prob_column")
+        return column, column
+    if per_side:
+        return (
+            _as_text(inputs["prob_column_a"], f"{where}.prob_column_a"),
+            _as_text(inputs["prob_column_b"], f"{where}.prob_column_b"),
+        )
+    return "prob", "prob"
+
+
+def _validate_inputs(
+    inputs: Any, kind: str, where: str, uncertainty_unit: str
+) -> Dict[str, Any]:
     saliency = kind == SALIENCY_KIND
     allowed = ["a", "b"]
     required = ["a", "b"]
@@ -198,12 +315,27 @@ def _validate_inputs(inputs: Any, kind: str, where: str) -> Dict[str, Any]:
         allowed += ["metric_column", "threshold"]
         required += ["metric_column", "threshold"]
     else:
-        allowed += ["prob_column", "label_column"]
+        allowed += ["prob_column", "prob_column_a", "prob_column_b", "label_column"]
+    if uncertainty_unit == PATIENT_UNIT:
+        allowed.append("patient_manifest")
+        required.append("patient_manifest")
+    elif isinstance(inputs, dict) and "patient_manifest" in inputs:
+        _fail(
+            where,
+            "patient_manifest is registered only with uncertainty_unit "
+            f"{PATIENT_UNIT!r}; an image-unit comparison resamples images and has no "
+            "patient identity (set uncertainty_unit and patient_manifest together)",
+        )
     _check_keys(inputs, where, allowed=allowed, required=required)
     normalized: Dict[str, Any] = {
         "a": _as_text(inputs["a"], f"{where}.a"),
         "b": _as_text(inputs["b"], f"{where}.b"),
     }
+    normalized["patient_manifest"] = (
+        _as_text(inputs["patient_manifest"], f"{where}.patient_manifest")
+        if uncertainty_unit == PATIENT_UNIT
+        else None
+    )
     if saliency:
         normalized["metric_column"] = _as_text(
             inputs["metric_column"], f"{where}.metric_column"
@@ -220,13 +352,49 @@ def _validate_inputs(inputs: Any, kind: str, where: str) -> Dict[str, Any]:
             "value": _as_number(threshold["value"], f"{where}.threshold.value"),
         }
     else:
-        normalized["prob_column"] = _as_text(
-            inputs.get("prob_column", "prob"), f"{where}.prob_column"
+        normalized["prob_column_a"], normalized["prob_column_b"] = (
+            _validate_prob_columns(inputs, where)
         )
         normalized["label_column"] = _as_text(
             inputs.get("label_column", "label"), f"{where}.label_column"
         )
     return normalized
+
+
+def _validate_zero_method(comparison: Any, where: str) -> str:
+    if "zero_method" not in comparison:
+        _fail(f"{where}.zero_method", "is required for saliency_paired")
+    zero_method = comparison["zero_method"]
+    if zero_method not in ZERO_METHODS:
+        _fail(
+            f"{where}.zero_method",
+            f"must be one of {list(ZERO_METHODS)}, got {zero_method!r}",
+        )
+    return zero_method
+
+
+def _validate_p_method(comparison: Any, where: str, zero_method: str) -> str:
+    """The registered p-value method: never chosen from the sample or the SciPy default."""
+    if "p_method" not in comparison:
+        _fail(
+            f"{where}.p_method",
+            "is required for saliency_paired; register one of "
+            f"{list(SALIENCY_P_METHODS)}",
+        )
+    p_method = comparison["p_method"]
+    if p_method not in SALIENCY_P_METHODS:
+        _fail(
+            f"{where}.p_method",
+            f"must be one of {list(SALIENCY_P_METHODS)}, got {p_method!r}",
+        )
+    if p_method == "permutation" and zero_method != "wilcox":
+        _fail(
+            f"{where}.p_method",
+            "permutation needs zero_method 'wilcox' (the exhaustive sign-flip test drops "
+            "zero differences and ranks the rest); register zero_method 'wilcox' or "
+            "p_method 'approx'",
+        )
+    return p_method
 
 
 def _validate_comparison(comparison: Any, where: str) -> Dict[str, Any]:
@@ -239,6 +407,7 @@ def _validate_comparison(comparison: Any, where: str) -> Dict[str, Any]:
         "cohort",
         "paired_difference",
         "zero_method",
+        "p_method",
         "uncertainty_unit",
         "bootstrap",
     ]
@@ -285,7 +454,6 @@ def _validate_comparison(comparison: Any, where: str) -> Dict[str, Any]:
     if description is not None:
         description = _as_text(description, f"{where}.description")
 
-    inputs = _validate_inputs(comparison["inputs"], kind, f"{where}.inputs")
     cohort = _validate_cohort(comparison.get("cohort"), f"{where}.cohort")
 
     paired_difference = comparison["paired_difference"]
@@ -299,17 +467,22 @@ def _validate_comparison(comparison: Any, where: str) -> Dict[str, Any]:
         _fail(
             f"{where}.uncertainty_unit",
             f"must be one of {list(UNCERTAINTY_UNITS)}, got {uncertainty_unit!r} "
-            "(patient-level units need a patient ID column, absent from the per-image CSVs)",
+            "(the resampling unit is registered, never chosen from the sample)",
         )
+    inputs = _validate_inputs(
+        comparison["inputs"], kind, f"{where}.inputs", uncertainty_unit
+    )
 
     if kind == SALIENCY_KIND:
-        if "zero_method" not in comparison:
-            _fail(f"{where}.zero_method", "is required for saliency_paired")
-        zero_method = comparison["zero_method"]
-        if zero_method not in ZERO_METHODS:
+        zero_method = _validate_zero_method(comparison, where)
+        p_method = _validate_p_method(comparison, where, zero_method)
+        if p_method == "mcnemar_exact" and uncertainty_unit == PATIENT_UNIT:
             _fail(
-                f"{where}.zero_method",
-                f"must be one of {list(ZERO_METHODS)}, got {zero_method!r}",
+                f"{where}.p_method",
+                "mcnemar_exact needs a binary 0/1 per-image outcome; with "
+                f"uncertainty_unit {PATIENT_UNIT!r} the registered values are "
+                "patient-mean differences, so register p_method 'permutation' "
+                f"(at most {PERMUTATION_MAX_N} non-zero patient differences) or 'approx'",
             )
     else:
         if "zero_method" in comparison:
@@ -317,7 +490,14 @@ def _validate_comparison(comparison: Any, where: str) -> Dict[str, Any]:
                 f"{where}.zero_method",
                 "is not applicable to classification_auroc (DeLong uses the raw scores)",
             )
+        if "p_method" in comparison:
+            _fail(
+                f"{where}.p_method",
+                "is not applicable to classification_auroc (the paired DeLong test is "
+                "fixed by the plan, not chosen per comparison)",
+            )
         zero_method = None
+        p_method = None
 
     bootstrap = comparison["bootstrap"]
     _check_keys(
@@ -342,6 +522,7 @@ def _validate_comparison(comparison: Any, where: str) -> Dict[str, Any]:
         "cohort": cohort,
         "paired_difference": paired_difference,
         "zero_method": zero_method,
+        "p_method": p_method,
         "uncertainty_unit": uncertainty_unit,
         "bootstrap": {"n": n_boot, "seed": seed},
     }
@@ -591,6 +772,108 @@ def _zero_and_tie_counts(differences: np.ndarray) -> Tuple[int, int]:
     return n_zero, int(counts[counts > 1].sum())
 
 
+def _sign_flip_deviations(doubled_ranks: np.ndarray) -> np.ndarray:
+    """|sum_i s_i * r_i| for all 2^n sign patterns s, built by doubling (exhaustive).
+
+    `doubled_ranks` holds 2 * (tie-averaged rank), so every value and every deviation is
+    an integer: the "at least as extreme" comparison is exact, with no float tolerance.
+    Pattern order carries no meaning, so the doubling order (last rank first) is fine.
+    """
+    deviations = np.zeros(1, dtype=np.int64)
+    for rank in doubled_ranks:
+        deviations = np.abs(np.concatenate((deviations + rank, deviations - rank)))
+    return deviations
+
+
+def _permutation_signed_rank_test(
+    differences: np.ndarray, comparison_id: str
+) -> Tuple[float, float]:
+    """Exhaustive sign-flip (permutation) test on the tie-averaged signed-rank statistic.
+
+    Zero differences are dropped (plan validation registers `zero_method="wilcox"`), the
+    remaining |d| are ranked with `rankdata` (ties averaged), and the two-sided p-value is
+    the proportion of the 2^n sign patterns whose |W+ - mean| is at least the observed
+    |W+ - mean|. Deterministic, no seed, no normal approximation. `statistic` follows
+    SciPy's two-sided convention min(W+, W-).
+    """
+    nonzero = np.asarray(differences, dtype=float)
+    nonzero = nonzero[nonzero != 0.0]
+    n = int(nonzero.size)
+    if n == 0:
+        return 0.0, 1.0
+    if n > PERMUTATION_MAX_N:
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: p_method 'permutation' must enumerate 2^n "
+            f"sign patterns over the {n} non-zero differences, above the limit of "
+            f"{PERMUTATION_MAX_N}; use p_method 'approx' for large cohorts"
+        )
+    doubled_ranks = np.rint(2.0 * rankdata(np.abs(nonzero))).astype(np.int64)
+    total = int(doubled_ranks.sum())
+    observed = int(doubled_ranks[nonzero > 0].sum())
+    deviations = _sign_flip_deviations(doubled_ranks)
+    extreme = int(np.count_nonzero(deviations >= abs(2 * observed - total)))
+    w_plus = observed / 2.0
+    w_minus = total / 2.0 - w_plus
+    return float(min(w_plus, w_minus)), extreme / float(2**n)
+
+
+def _approx_signed_rank_test(
+    differences: np.ndarray, zero_method: str, comparison_id: str
+) -> Tuple[float, float]:
+    """SciPy's normal approximation, requested explicitly (`method="approx"`).
+
+    The registered method is passed through; SciPy's `auto` (exact below 50 pairs unless
+    there are zeros) is never reachable from a plan. All-zero differences have no ranked
+    observation left: they are recorded as `statistic=0.0, p_raw=1.0, degenerate=True`
+    instead of reaching SciPy's ValueError.
+    """
+    if np.all(differences == 0.0):
+        return 0.0, 1.0
+    try:
+        result = wilcoxon(
+            differences,
+            zero_method=zero_method,
+            alternative="two-sided",
+            method="approx",
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: Wilcoxon signed-rank failed "
+            f"(p_method='approx', zero_method={zero_method!r}, n={differences.size}): "
+            f"{exc}"
+        ) from exc
+    return float(result.statistic), float(result.pvalue)
+
+
+def _binary_discordant_counts(
+    values_a: np.ndarray, values_b: np.ndarray, comparison_id: str
+) -> Tuple[int, int]:
+    """Count b (a=0 -> b=1 gains) and c (a=1 -> b=0 losses) on binary 0/1 pairs."""
+    for side, values in (("a", values_a), ("b", values_b)):
+        invalid = values[~np.isin(values, (0.0, 1.0))]
+        if invalid.size:
+            raise RuntimeError(
+                f"comparison {comparison_id!r}: p_method 'mcnemar_exact' needs binary "
+                f"0/1 values on both sides; input {side} has {invalid.size} non-binary "
+                f"value(s), found {float(invalid[0])!r} in input {side}"
+            )
+    b = int(np.count_nonzero((values_b == 1.0) & (values_a == 0.0)))
+    c = int(np.count_nonzero((values_b == 0.0) & (values_a == 1.0)))
+    return b, c
+
+
+def _mcnemar_exact_test(
+    values_a: np.ndarray, values_b: np.ndarray, comparison_id: str
+) -> Tuple[float, float]:
+    """Exact McNemar on the discordant binary pairs: two-sided exact binomial b vs c."""
+    b, c = _binary_discordant_counts(values_a, values_b, comparison_id)
+    discordant = b + c
+    if discordant == 0:
+        return 0.0, 1.0
+    smaller = min(b, c)
+    return float(smaller), float(binomtest(smaller, discordant, 0.5).pvalue)
+
+
 def _percentile_ci(values: np.ndarray) -> Tuple[float, float]:
     tail = (1.0 - CI_LEVEL) / 2.0 * 100.0
     low, high = np.percentile(values, [tail, 100.0 - tail])
@@ -600,10 +883,12 @@ def _percentile_ci(values: np.ndarray) -> Tuple[float, float]:
 def bootstrap_mean_median_ci(
     differences: np.ndarray, n_boot: int, seed: int
 ) -> Dict[str, Any]:
-    """Percentile bootstrap over images of the mean and the median paired difference.
+    """Percentile bootstrap of the mean and the median paired difference.
 
-    Every draw resamples image differences with replacement (the registered uncertainty
-    unit is the image), using the registered `n` and `seed`.
+    `differences` holds one value per registered uncertainty unit: an image difference
+    for `uncertainty_unit: "image"`, or a patient-mean difference for
+    `uncertainty_unit: "patient"`, so resampling these values resamples the registered
+    unit with replacement (registered `n` and `seed`).
     """
     diff = np.asarray(differences, dtype=float)
     if diff.size == 0:
@@ -628,31 +913,63 @@ def bootstrap_mean_median_ci(
     }
 
 
-def bootstrap_auroc_diff_ci(
+def patient_mean_differences(
+    differences: np.ndarray, patient_ids: np.ndarray
+) -> np.ndarray:
+    """Collapse paired image differences to one value per patient: the mean of `b - a`.
+
+    The registered patient-level estimand is the mean of the patient-mean differences,
+    so a patient with two images contributes one observation, never two. Returned in
+    sorted patient-ID order, so row order in the inputs cannot change the result.
+    """
+    frame = pd.DataFrame(
+        {
+            "patient_id": np.asarray(patient_ids, dtype=str),
+            "difference": np.asarray(differences, dtype=float),
+        }
+    )
+    means = frame.groupby("patient_id", sort=True)["difference"].mean()
+    return means.to_numpy(dtype=float)
+
+
+def patient_blocks(patient_ids: np.ndarray) -> List[np.ndarray]:
+    """Row positions of each patient, ordered by sorted patient ID."""
+    ids = np.asarray(patient_ids, dtype=str)
+    return [np.flatnonzero(ids == patient) for patient in np.unique(ids)]
+
+
+def cluster_draw(blocks: Sequence[np.ndarray], rng: np.random.Generator) -> np.ndarray:
+    """One cluster-bootstrap draw: patients with replacement, all images of each drawn patient.
+
+    `blocks` comes from `patient_blocks`. A drawn patient contributes every one of its
+    rows, so within-patient dependence is preserved instead of being broken into
+    independent images.
+    """
+    if not blocks:
+        raise ValueError("cluster bootstrap needs at least one patient block")
+    chosen = rng.integers(0, len(blocks), size=len(blocks))
+    return np.concatenate([blocks[index] for index in chosen])
+
+
+def _auroc_diff_percentile_ci(
     labels: np.ndarray,
     prob_a: np.ndarray,
     prob_b: np.ndarray,
+    draws: Sequence[np.ndarray],
     n_boot: int,
-    seed: int,
 ) -> Dict[str, Any]:
-    """Percentile bootstrap over images of AUROC(b) - AUROC(a).
+    """Percentile CI of AUROC(b) - AUROC(a) over the supplied resample index draws.
 
     A resample that contains one class only has no AUROC; it is skipped and counted in
     `n_used` (never hidden). No valid resample raises.
     """
-    y = np.asarray(labels, dtype=int)
-    pa = np.asarray(prob_a, dtype=float)
-    pb = np.asarray(prob_b, dtype=float)
-    rng = np.random.default_rng(seed)
-    n = y.size
     differences = []
-    for _ in range(n_boot):
-        index = rng.integers(0, n, size=n)
-        sample = y[index]
+    for index in draws:
+        sample = labels[index]
         if sample.min() == sample.max():
             continue
         differences.append(
-            roc_auc_score(sample, pb[index]) - roc_auc_score(sample, pa[index])
+            roc_auc_score(sample, prob_b[index]) - roc_auc_score(sample, prob_a[index])
         )
     if not differences:
         raise RuntimeError(
@@ -667,6 +984,49 @@ def bootstrap_auroc_diff_ci(
         "ci_low": low,
         "ci_high": high,
     }
+
+
+def bootstrap_auroc_diff_ci(
+    labels: np.ndarray,
+    prob_a: np.ndarray,
+    prob_b: np.ndarray,
+    n_boot: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """Percentile bootstrap over images of AUROC(b) - AUROC(a).
+
+    Every draw resamples image rows with replacement (the registered image unit).
+    """
+    y = np.asarray(labels, dtype=int)
+    pa = np.asarray(prob_a, dtype=float)
+    pb = np.asarray(prob_b, dtype=float)
+    rng = np.random.default_rng(seed)
+    draws = (rng.integers(0, y.size, size=y.size) for _ in range(n_boot))
+    return _auroc_diff_percentile_ci(y, pa, pb, draws, n_boot)
+
+
+def bootstrap_auroc_diff_ci_clustered(
+    labels: np.ndarray,
+    prob_a: np.ndarray,
+    prob_b: np.ndarray,
+    patient_ids: np.ndarray,
+    n_boot: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """Percentile cluster bootstrap of AUROC(b) - AUROC(a).
+
+    Every draw resamples patients with replacement and keeps all images of each drawn
+    patient (`cluster_draw`), so the interval reflects repeated patients. The estimate
+    itself stays the pooled image-level AUROC difference: only the uncertainty is
+    clustered.
+    """
+    y = np.asarray(labels, dtype=int)
+    pa = np.asarray(prob_a, dtype=float)
+    pb = np.asarray(prob_b, dtype=float)
+    blocks = patient_blocks(patient_ids)
+    rng = np.random.default_rng(seed)
+    draws = (cluster_draw(blocks, rng) for _ in range(n_boot))
+    return _auroc_diff_percentile_ci(y, pa, pb, draws, n_boot)
 
 
 def delong_paired(
@@ -856,17 +1216,170 @@ def _prepare_classification_side(
     return _apply_cohort(frame, comparison["cohort"], comparison["id"], side)
 
 
+# --------------------------------------------------------------------------- patient identity
+
+
+def load_patient_map(path: Path, comparison_id: str) -> pd.DataFrame:
+    """Load the frozen `image_id` -> `patient_id` manifest (hash and record verified).
+
+    `load_frozen` refuses a manifest whose csv, `.sha256` and `.record.json` do not
+    agree, so a patient map is never edited after the plan is locked. The manifest must
+    name each image once with a non-empty patient ID.
+    """
+    try:
+        frame = load_frozen(path)
+    except Exception as exc:  # noqa: BLE001 - surfaced with comparison identity
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: patient manifest {path} could not be loaded: "
+            f"{exc}"
+        ) from exc
+    missing = [
+        column for column in ("image_id", "patient_id") if column not in frame.columns
+    ]
+    if missing:
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: patient manifest {path} is missing "
+            f"column(s) {missing} (columns: {list(frame.columns)})"
+        )
+    image_ids = frame["image_id"].astype(str)
+    duplicated = image_ids[image_ids.duplicated(keep=False)]
+    if len(duplicated):
+        examples = sorted(set(duplicated))[:5]
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: patient manifest {path} has "
+            f"{duplicated.nunique()} duplicated image_id(s) over {len(duplicated)} "
+            f"row(s); examples {examples}"
+        )
+    patients = frame["patient_id"]
+    empty = patients.isna() | (patients.astype(str).str.strip() == "")
+    if bool(empty.any()):
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: patient manifest {path} has "
+            f"{int(empty.sum())} row(s) with an empty patient_id; examples "
+            f"{image_ids[empty].tolist()[:5]}"
+        )
+    return pd.DataFrame(
+        {"image_id": image_ids, "patient_id": patients.astype(str)}
+    )
+
+
+def patient_assignments(
+    aligned: pd.DataFrame, patient_map: pd.DataFrame, comparison_id: str
+) -> np.ndarray:
+    """Patient ID of every aligned row, in row order; an unmapped image raises."""
+    rows = pd.DataFrame({"image_id": aligned["image_id"].astype(str)})
+    merged = rows.merge(patient_map, on="image_id", how="left")
+    unmapped = merged["patient_id"].isna()
+    if bool(unmapped.any()):
+        examples = merged.loc[unmapped, "image_id"].tolist()[:5]
+        raise RuntimeError(
+            f"comparison {comparison_id!r}: {int(unmapped.sum())} aligned image(s) have "
+            f"no patient_id in the frozen manifest; examples {examples}"
+        )
+    return merged["patient_id"].to_numpy(dtype=str)
+
+
+def _patient_context(
+    comparison: Dict[str, Any], aligned: pd.DataFrame, plan_dir: Path
+) -> Optional[Dict[str, Any]]:
+    """Patient identity and summary counts for a patient-unit comparison, else None."""
+    if comparison["uncertainty_unit"] != PATIENT_UNIT:
+        return None
+    manifest_path = _resolve_input(comparison["inputs"]["patient_manifest"], plan_dir)
+    patient_map = load_patient_map(manifest_path, comparison["id"])
+    patient_ids = patient_assignments(aligned, patient_map, comparison["id"])
+    patients, counts = np.unique(patient_ids, return_counts=True)
+    return {
+        "patient_ids": patient_ids,
+        # Absolute on disk, so a report never depends on the directory the plan was
+        # invoked from (`_resolve_input` keeps the plan-relative spelling).
+        "manifest": str(manifest_path.resolve()),
+        "sha256": sha256_file(manifest_path),
+        "n_patients": int(patients.size),
+        "n_multi_image_patients": int(np.count_nonzero(counts > 1)),
+        "max_images_per_patient": int(counts.max()),
+    }
+
+
+def _patient_fields(
+    context: Optional[Dict[str, Any]], n_images: int
+) -> Dict[str, Any]:
+    """Output fields describing the registered unit; image-unit rows record None."""
+    if context is None:
+        return {
+            "n_images": int(n_images),
+            "n_patients": None,
+            "n_multi_image_patients": None,
+            "max_images_per_patient": None,
+            "patient_manifest": None,
+            "patient_manifest_sha256": None,
+        }
+    return {
+        "n_images": int(n_images),
+        "n_patients": context["n_patients"],
+        "n_multi_image_patients": context["n_multi_image_patients"],
+        "max_images_per_patient": context["max_images_per_patient"],
+        "patient_manifest": context["manifest"],
+        "patient_manifest_sha256": context["sha256"],
+    }
+
+
+def _p_clustering_aware(kind: str, uncertainty_unit: str) -> Optional[bool]:
+    """Does the registered p-value model the within-patient dependence of the rows?
+
+    `classification_auroc` always uses the image-level paired DeLong test, which cannot
+    model clustering: on patient-unit rows that limit is recorded as `False` rather than
+    claimed away (a cluster-robust p-value is not invented). `saliency_paired` on patient
+    units tests the patient-mean differences themselves, one value per patient, so it is
+    clustering-aware. Image-unit rows have no patient identity: `None`.
+    """
+    if uncertainty_unit != PATIENT_UNIT:
+        return None
+    return kind == SALIENCY_KIND
+
+
 # --------------------------------------------------------------------------- comparisons
+
+
+def _signed_rank_test(
+    comparison: Dict[str, Any], differences: np.ndarray
+) -> Tuple[float, float]:
+    """Run the registered signed-rank `p_method` on one value per registered unit."""
+    p_method = comparison["p_method"]
+    if p_method == "permutation":
+        return _permutation_signed_rank_test(differences, comparison["id"])
+    if p_method == "approx":
+        return _approx_signed_rank_test(
+            differences, comparison["zero_method"], comparison["id"]
+        )
+    raise RuntimeError(
+        f"comparison {comparison['id']!r}: p_method {p_method!r} needs the per-image "
+        "0/1 pairs and is not a signed-rank test on one value per unit"
+    )
+
+
+def _saliency_test(
+    comparison: Dict[str, Any], values_a: np.ndarray, values_b: np.ndarray
+) -> Tuple[float, float]:
+    """Run the registered `p_method` on the aligned image pairs; (statistic, p_raw)."""
+    if comparison["p_method"] == "mcnemar_exact":
+        return _mcnemar_exact_test(values_a, values_b, comparison["id"])
+    return _signed_rank_test(comparison, values_b - values_a)
 
 
 def saliency_paired_comparison(
     comparison: Dict[str, Any], plan_dir: Path
 ) -> Dict[str, Any]:
-    """Paired saliency comparison: Wilcoxon signed-rank on `b - a` + bootstrap CI.
+    """Paired saliency comparison: the registered `p_method` on `b - a` + bootstrap CI.
 
-    `estimate` is the mean paired difference; its percentile CI is written to the CSV
-    `ci_low`/`ci_high`. The median and its CI are kept in the family JSON alongside the
-    zero/tie counts the registered zero rule depends on.
+    `estimate` is the mean paired difference on the registered unit: the image mean, or
+    for `uncertainty_unit: "patient"` the mean of the patient-mean differences (one
+    value per patient, `n` counts patients and `n_images` is also recorded). Its
+    percentile CI is written to the CSV `ci_low`/`ci_high`. The median and its CI are
+    kept in the family JSON alongside the zero/tie counts the registered zero rule
+    depends on. The p-value comes from the registered `p_method` (`permutation`,
+    `approx` or `mcnemar_exact`), never from the sample size, the presence of
+    ties/zeros, or SciPy's `method="auto"`.
     """
     if comparison["kind"] != SALIENCY_KIND:
         raise ValueError(f"not a {SALIENCY_KIND} comparison: {comparison['id']!r}")
@@ -878,30 +1391,28 @@ def saliency_paired_comparison(
     values_a = _numeric_column(aligned_a, inputs["metric_column"], cid, "a")
     values_b = _numeric_column(aligned_b, inputs["metric_column"], cid, "b")
     differences = values_b - values_a
-    n = int(differences.size)
-    if n < 1:
+    n_images = int(differences.size)
+    if n_images < 1:
         raise RuntimeError(f"comparison {cid!r}: no aligned rows to test")
 
-    n_zero, n_ties = _zero_and_tie_counts(differences)
-    degenerate = bool(np.all(differences == 0.0))
-    if degenerate:
-        statistic, p_value = 0.0, 1.0
+    patient_context = _patient_context(comparison, aligned_a, plan_dir)
+    if patient_context is None:
+        unit_differences = differences
+        tie_quantity = "|b - a| (non-zero)"
+        statistic, p_value = _saliency_test(comparison, values_a, values_b)
     else:
-        try:
-            result = wilcoxon(
-                differences,
-                zero_method=comparison["zero_method"],
-                alternative="two-sided",
-            )
-        except ValueError as exc:
-            raise RuntimeError(
-                f"comparison {cid!r}: Wilcoxon signed-rank failed "
-                f"(zero_method={comparison['zero_method']!r}, n={n}): {exc}"
-            ) from exc
-        statistic, p_value = float(result.statistic), float(result.pvalue)
+        unit_differences = patient_mean_differences(
+            differences, patient_context["patient_ids"]
+        )
+        tie_quantity = "patient-mean |b - a| (non-zero)"
+        statistic, p_value = _signed_rank_test(comparison, unit_differences)
+
+    n = int(unit_differences.size)
+    n_zero, n_ties = _zero_and_tie_counts(unit_differences)
+    degenerate = bool(np.all(unit_differences == 0.0))
 
     bootstrap = bootstrap_mean_median_ci(
-        differences,
+        unit_differences,
         comparison["bootstrap"]["n"],
         comparison["bootstrap"]["seed"],
     )
@@ -915,29 +1426,37 @@ def saliency_paired_comparison(
             "b": str(_resolve_input(inputs["b"], plan_dir)),
             "metric_column": inputs["metric_column"],
             "threshold": inputs["threshold"],
+            "patient_manifest": (
+                patient_context["manifest"] if patient_context is not None else None
+            ),
         },
         "cohort": comparison["cohort"],
         "paired_difference": comparison["paired_difference"],
         "zero_method": comparison["zero_method"],
+        "p_method": comparison["p_method"],
         "uncertainty_unit": comparison["uncertainty_unit"],
+        "p_clustering_aware": _p_clustering_aware(
+            SALIENCY_KIND, comparison["uncertainty_unit"]
+        ),
         "bootstrap": {
             "n": comparison["bootstrap"]["n"],
             "seed": comparison["bootstrap"]["seed"],
             "n_used": bootstrap["n_used"],
         },
         "n": n,
-        "estimate": float(differences.mean()),
+        "estimate": float(unit_differences.mean()),
         "ci_low": bootstrap["ci_mean_low"],
         "ci_high": bootstrap["ci_mean_high"],
         "statistic": statistic,
         "p_raw": p_value,
         "n_zero_diffs": n_zero,
         "n_ties": n_ties,
-        "tie_quantity": "|b - a| (non-zero)",
-        "median_diff": float(np.median(differences)),
+        "tie_quantity": tie_quantity,
+        "median_diff": float(np.median(unit_differences)),
         "ci_median_low": bootstrap["ci_median_low"],
         "ci_median_high": bootstrap["ci_median_high"],
         "degenerate": degenerate,
+        **_patient_fields(patient_context, n_images),
     }
 
 
@@ -946,16 +1465,21 @@ def classification_auroc_comparison(
 ) -> Dict[str, Any]:
     """Paired DeLong test on aligned rows + bootstrap CI of the AUROC difference.
 
-    `estimate` is AUROC(b) - AUROC(a). `n_zero_diffs`/`n_ties` describe the paired
-    probability differences (the registered `b - a`); DeLong itself uses the raw scores
-    and applies its own midrank tie correction.
+    `estimate` is AUROC(b) - AUROC(a), pooled over the aligned rows. `n_zero_diffs`/
+    `n_ties` describe the paired probability differences (the registered `b - a`);
+    DeLong itself uses the raw scores and applies its own midrank tie correction.
+
+    With `uncertainty_unit: "patient"` the interval is a cluster bootstrap over patients
+    and `p_clustering_aware` is `False`: the p-value stays the image-level paired DeLong
+    test, which cannot model the repeated patients (no cluster-robust p is invented).
     """
     if comparison["kind"] != CLASSIFICATION_KIND:
         raise ValueError(f"not a {CLASSIFICATION_KIND} comparison: {comparison['id']!r}")
     cid = comparison["id"]
     inputs = comparison["inputs"]
     label_column = inputs["label_column"]
-    prob_column = inputs["prob_column"]
+    prob_column_a = inputs["prob_column_a"]
+    prob_column_b = inputs["prob_column_b"]
     frame_a = _prepare_classification_side(comparison, "a", plan_dir)
     frame_b = _prepare_classification_side(comparison, "b", plan_dir)
     aligned_a, aligned_b = align_by_id(frame_a, frame_b, key="image_id")
@@ -983,25 +1507,39 @@ def classification_auroc_comparison(
             f"comparison {cid!r}: cohort has a single class; AUROC is undefined"
         )
 
-    probs_a = _numeric_column(aligned_a, prob_column, cid, "a")
-    probs_b = _numeric_column(aligned_b, prob_column, cid, "b")
-    for side, probs in (("a", probs_a), ("b", probs_b)):
+    probs_a = _numeric_column(aligned_a, prob_column_a, cid, "a")
+    probs_b = _numeric_column(aligned_b, prob_column_b, cid, "b")
+    for side, column, probs in (
+        ("a", prob_column_a, probs_a),
+        ("b", prob_column_b, probs_b),
+    ):
         if np.any((probs < 0.0) | (probs > 1.0)):
             raise RuntimeError(
-                f"comparison {cid!r}: input {side} {prob_column!r} is not in [0, 1]; "
+                f"comparison {cid!r}: input {side} {column!r} is not in [0, 1]; "
                 "the plan compares probabilities, not logits"
             )
 
     statistic, p_value, degenerate = delong_paired(labels, probs_a, probs_b)
     auroc_a = float(roc_auc_score(labels, probs_a))
     auroc_b = float(roc_auc_score(labels, probs_b))
-    bootstrap = bootstrap_auroc_diff_ci(
-        labels,
-        probs_a,
-        probs_b,
-        comparison["bootstrap"]["n"],
-        comparison["bootstrap"]["seed"],
-    )
+    patient_context = _patient_context(comparison, aligned_a, plan_dir)
+    if patient_context is None:
+        bootstrap = bootstrap_auroc_diff_ci(
+            labels,
+            probs_a,
+            probs_b,
+            comparison["bootstrap"]["n"],
+            comparison["bootstrap"]["seed"],
+        )
+    else:
+        bootstrap = bootstrap_auroc_diff_ci_clustered(
+            labels,
+            probs_a,
+            probs_b,
+            patient_context["patient_ids"],
+            comparison["bootstrap"]["n"],
+            comparison["bootstrap"]["seed"],
+        )
     n_zero, n_ties = _zero_and_tie_counts(probs_b - probs_a)
     return {
         "comparison_id": cid,
@@ -1011,12 +1549,19 @@ def classification_auroc_comparison(
         "inputs": {
             "a": str(_resolve_input(inputs["a"], plan_dir)),
             "b": str(_resolve_input(inputs["b"], plan_dir)),
-            "prob_column": prob_column,
+            "prob_column_a": prob_column_a,
+            "prob_column_b": prob_column_b,
             "label_column": label_column,
+            "patient_manifest": (
+                patient_context["manifest"] if patient_context is not None else None
+            ),
         },
         "cohort": comparison["cohort"],
         "paired_difference": comparison["paired_difference"],
         "uncertainty_unit": comparison["uncertainty_unit"],
+        "p_clustering_aware": _p_clustering_aware(
+            CLASSIFICATION_KIND, comparison["uncertainty_unit"]
+        ),
         "bootstrap": {
             "n": comparison["bootstrap"]["n"],
             "seed": comparison["bootstrap"]["seed"],
@@ -1036,6 +1581,7 @@ def classification_auroc_comparison(
         "n_ties": n_ties,
         "tie_quantity": "|b - a| (non-zero)",
         "delong_degenerate": degenerate,
+        **_patient_fields(patient_context, int(labels.size)),
     }
 
 
@@ -1142,6 +1688,7 @@ def run_plan(path: Path, out_dir: Path) -> Dict[str, Any]:
             {
                 "comparison_id": record["comparison_id"],
                 "endpoint_class": record["endpoint_class"],
+                "p_method": record.get("p_method"),
                 "n": record["n"],
                 "estimate": record["estimate"],
                 "ci_low": record["ci_low"],
@@ -1151,6 +1698,12 @@ def run_plan(path: Path, out_dir: Path) -> Dict[str, Any]:
                 "p_bh": record["p_bh"],
                 "reject": record["reject"],
                 "plan_sha256": digest,
+                "uncertainty_unit": record["uncertainty_unit"],
+                "n_images": record["n_images"],
+                "n_patients": record["n_patients"],
+                "n_multi_image_patients": record["n_multi_image_patients"],
+                "patient_manifest_sha256": record["patient_manifest_sha256"],
+                "p_clustering_aware": record["p_clustering_aware"],
             }
             for record in records
         ]
