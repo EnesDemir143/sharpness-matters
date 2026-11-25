@@ -693,11 +693,13 @@ def summarize_scores(
     Three cohorts are reported side by side and are never collapsed into one number:
     `all_positive` (K1, every GT-positive image, decision independent),
     `tp_conditional` (positive decision only) and `joint` (K1 denominator, a wrong
-    negative contributes 0; coverage keeps its own positive-decision denominator because
-    the author records no coverage for a wrong negative). The threshold-free `hit` and
-    `pixel_auprc` of the main rule (protocol §4.4 E3/E4) use the same three denominators;
-    in `joint` a wrong negative contributes 0 for both, exactly like IoU / precision.
-    The legacy rule has no such columns, so their means come out NaN (JSON null).
+    negative contributes 0). Coverage uses the same denominator as its cohort: the
+    pixel coverage is recorded for every GT-positive image, including a wrong negative,
+    but in `joint` a wrong negative contributes 0 rather than its own pixel coverage, so
+    `joint.coverage_n` equals `joint.n`. The threshold-free `hit` and `pixel_auprc` of
+    the main rule (protocol §4.4 E3/E4) use the same three denominators; in `joint` a
+    wrong negative contributes 0 for both, exactly like IoU / precision. The legacy rule
+    has no such columns, so their means come out NaN (JSON null).
     """
     summaries: Dict[str, Any] = {}
     for threshold in thresholds:
@@ -717,6 +719,9 @@ def summarize_scores(
         )
         joint_precision_mean, joint_precision_std = _mean_std(
             [row["precision"] if row["decision"] == 1 else 0.0 for row in subset]
+        )
+        joint_coverage_mean, _ = _mean_std(
+            [row["coverage"] if row["decision"] == 1 else 0.0 for row in subset]
         )
         hit_mean = _mean_if_present(subset, "hit")
         pixel_auprc_mean = _mean_if_present(subset, "pixel_auprc")
@@ -769,8 +774,8 @@ def summarize_scores(
                 "iou_std": joint_iou_std,
                 "precision_mean": joint_precision_mean,
                 "precision_std": joint_precision_std,
-                "coverage_mean": tp_coverage_mean,
-                "coverage_n": len(positive),
+                "coverage_mean": joint_coverage_mean,
+                "coverage_n": len(subset),
                 "hit_mean": joint_hit_mean,
                 "pixel_auprc_mean": joint_pixel_auprc_mean,
             },
