@@ -37,7 +37,14 @@ predictions are saved keyed by ImageId for further analysis.
 #   check: tests/corrected/test_e2_e4_eval.py::test_vindr_wide_mode_writes_both_labels,
 #   ::test_vindr_wide_sensitivity_auroc_uses_same_predictions
 
-Usage:
+# B (Section 4.7 / 6.1): every cohort below is read from an existing frozen artifact
+#   (`frozen.load_frozen` checks csv + .sha256 + .record.json) and the loaded dataset is
+#   compared with that frame; nothing is rebuilt. E5 additionally binds each mode to its
+#   canonical manifest (`eval_manifests.load_e5_manifest`), so E5-clean passed to
+#   ood_reference_like (or a renamed copy of it) is refused before inference.
+#   check: tests/corrected/test_manifest_eval_integrity.py
+#
+# Usage:
     Run this module directly:
         python3 evaluate_kfold.py --validation_mode=<validation_dataset>
         python3 evaluate_kfold.py --validation_mode=ood_clean --e5_manifest=manifests/reference_like_clean.csv
@@ -69,15 +76,23 @@ from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
 from sharpness_matters.ptx.datasets.vin_dataset import VinDataset
 from sharpness_matters.ptx.datasets.ptx498_dataset import OODTestDataset
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
-from sharpness_matters.ptx.corrected.frozen import manifest_dir, sha256_file
+from sharpness_matters.ptx.corrected.frozen import (
+    load_frozen,
+    manifest_dir,
+    sha256_file,
+)
+from sharpness_matters.ptx.corrected.eval_manifests import (
+    load_e5_manifest,
+    verify_dataset_against_frozen,
+)
 from sharpness_matters.ptx.corrected.make_chexlocalize import (
     CLS_MANIFEST_NAME as CHEXLOCALIZE_CLS_MANIFEST,
 )
 from sharpness_matters.ptx.corrected.make_vindr_test import (
     MANIFEST_NAME as VINDR_TEST_MANIFEST,
+    WIDE_COLUMNS as VINDR_WIDE_COLUMNS,
     WIDE_MANIFEST_NAME as VINDR_WIDE_MANIFEST,
     WIDE_SPLITS,
-    load_vindr_wide_manifest,
 )
 from sharpness_matters.ptx.utils.classification_eval import (
     auroc_confidence_interval,
@@ -116,16 +131,22 @@ def _legacy_npy_prefix(validation_mode: str) -> str:
 
 
 def _chexlocalize_cohort_columns(
-    manifest_csv: Path, ids: list
+    manifest_csv: Path, ids: list, manifest_frame: Optional[pd.DataFrame] = None
 ) -> Dict[str, list]:
     """Align the frozen E4 classification manifest's split/patient_id to dataset order.
 
     The dataset keeps manifest order (`image_ids`), so the metadata columns are read
     straight from the same manifest and checked against that order; a reordered or
-    duplicated cohort raises instead of mislabelling a prediction row.
+    duplicated cohort raises instead of mislabelling a prediction row. Evaluation
+    passes the already hash-verified frame so the metadata cannot come from a second,
+    different read of the path.
     """
-    manifest = pd.read_csv(
-        manifest_csv, dtype={"image_id": str, "split": str, "patient_id": str}
+    manifest = (
+        manifest_frame
+        if manifest_frame is not None
+        else pd.read_csv(
+            manifest_csv, dtype={"image_id": str, "split": str, "patient_id": str}
+        )
     )
     missing = {"image_id", "split", "patient_id"} - set(manifest.columns)
     if missing:
@@ -187,7 +208,16 @@ def fetch_results_per_resolution(
                 f"validation_mode={validation_mode} needs the E5 manifest path "
                 "(reference-like and clean are different ID sets)"
             )
-        vin_ds = VinDataset(manifest_csv=e5_manifest, img_size=img_size)
+        # B (Section 4.7 / 6.1): the mode owns one frozen cohort. The path must be
+        # frozen and carry that cohort's content; the other mode's manifest (or a
+        # renamed copy of it) is rejected here, before any dataset or checkpoint.
+        e5_path, e5_frame = load_e5_manifest(
+            validation_mode, e5_manifest, manifest_dir()
+        )
+        vin_ds = VinDataset(manifest_csv=str(e5_path), img_size=img_size)
+        verify_dataset_against_frozen(
+            vin_ds, e5_frame, what=f"{validation_mode} VinDr cohort"
+        )
         ptx_ds = OODTestDataset(img_size=img_size)
         dataset = ConcatDataset([vin_ds, ptx_ds])
         ids = list(vin_ds.image_ids) + list(ptx_ds.image_ids)
@@ -199,11 +229,13 @@ def fetch_results_per_resolution(
         # B (§4.4 E2): official test split only; no PTX-498 images are mixed in, so the
         # positives and negatives come from the same validated VinDr cohort.
         manifest_csv = manifest_dir() / VINDR_TEST_MANIFEST
+        frozen_test = load_frozen(manifest_csv)
         dataset = VinDataset(
             manifest_csv=str(manifest_csv),
             root_dir=str(cfg.ptx.vindr.test_root_dir),
             img_size=img_size,
         )
+        verify_dataset_against_frozen(dataset, frozen_test, what="VinDr test cohort")
         ids = list(dataset.image_ids)
         sources = ["vindr_test"] * len(ids)
         expected = [int(dataset.labels[i]) for i in ids]
@@ -215,10 +247,16 @@ def fetch_results_per_resolution(
         )
 
         manifest_csv = manifest_dir() / CHEXLOCALIZE_CLS_MANIFEST
+        frozen_cls = load_frozen(manifest_csv)
         dataset = CheXlocalizeDataset(str(manifest_csv), img_size)
+        verify_dataset_against_frozen(
+            dataset, frozen_cls, what="CheXlocalize classification cohort"
+        )
         ids = list(dataset.image_ids)
         expected = [int(dataset.labels[i]) for i in ids]
-        cohort = _chexlocalize_cohort_columns(manifest_csv, ids)
+        cohort = _chexlocalize_cohort_columns(
+            manifest_csv, ids, manifest_frame=frozen_cls
+        )
         extra_columns = [
             (None, "split", cohort["split"]),
             (None, "patient_id", cohort["patient_id"]),
@@ -230,7 +268,13 @@ def fetch_results_per_resolution(
         # per-split views are written to a temporary dir (never frozen separately) and
         # removed once the datasets have parsed them.
         manifest_csv = manifest_dir() / VINDR_WIDE_MANIFEST
-        wide = load_vindr_wide_manifest()
+        wide = load_frozen(manifest_csv)
+        missing_wide = set(VINDR_WIDE_COLUMNS) - set(wide.columns)
+        if missing_wide:
+            raise KeyError(
+                f"{manifest_csv} is missing columns {sorted(missing_wide)}; the "
+                "frozen E2-wide manifest must carry both labels and split"
+            )
         split_dir = Path(
             tempfile.mkdtemp(prefix=f"vindr_wide_{sha256_file(manifest_csv)[:12]}_")
         )
@@ -261,6 +305,20 @@ def fetch_results_per_resolution(
             if split_ids != part["image_id"].astype(str).tolist():
                 raise RuntimeError(
                     f"{split}: VinDataset order differs from the frozen wide manifest"
+                )
+            frozen_split_labels = {
+                str(image_id): int(label)
+                for image_id, label in zip(part["image_id"], part["label"])
+            }
+            split_mismatched = [
+                image_id
+                for image_id in split_ids
+                if int(split_ds.labels[image_id]) != frozen_split_labels[image_id]
+            ]
+            if split_mismatched:
+                raise RuntimeError(
+                    f"{split}: VinDataset labels differ from the frozen wide manifest "
+                    f"for {len(split_mismatched)} ids, e.g. {split_mismatched[:5]}"
                 )
             split_datasets.append(split_ds)
             ids.extend(split_ids)

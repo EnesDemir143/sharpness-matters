@@ -105,6 +105,17 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _freeze_manifest(path: Path, frame: pd.DataFrame, item: str) -> Path:
+    """Write a csv plus the .sha256/.record.json pair load_frozen requires."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+    digest = _sha256(path)
+    Path(str(path) + ".sha256").write_text(digest + "\n", encoding="utf-8")
+    record = {"csv": str(path), "csv_sha256": digest, "item": item}
+    Path(str(path) + ".record.json").write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
 def _write_checkpoint(path: Path, bias: float) -> None:
     model = TinyClassifier(bias=bias)
     torch.save(
@@ -385,6 +396,11 @@ def test_vindr_wide_missing_dicom_raises(tmp_path):
 def test_vindr_test_mode_writes_id_csv(tmp_path, monkeypatch, ckpt_dir):
     _write_record(ckpt_dir, FOLD_BIASES, tau=0.7)
     manifests = tmp_path / "manifests"
+    _freeze_manifest(
+        manifests / "vindr_test.csv",
+        pd.DataFrame({"image_id": IDS, "label": LABELS}),
+        "E2 VinDr official test manifest",
+    )
     monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: manifests)
     monkeypatch.setattr(evaluate_kfold, "HOME", tmp_path)
     monkeypatch.setattr(cfg.ptx.vindr, "test_root_dir", str(tmp_path / "vindr_test"))
@@ -479,7 +495,12 @@ def test_chexlocalize_mode_keeps_split_and_patient_id(
     _write_record(ckpt_dir, FOLD_BIASES, tau=0.7)
     manifests = tmp_path / "manifests"
     manifests.mkdir()
-    _write_chexlocalize_manifest(manifests / "chexlocalize_cls.csv")
+    cls_path = _write_chexlocalize_manifest(manifests / "chexlocalize_cls.csv")
+    _freeze_manifest(
+        cls_path,
+        pd.read_csv(cls_path, dtype={"image_id": str}),
+        "E4 CheXlocalize cls manifest",
+    )
     monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: manifests)
     monkeypatch.setattr(evaluate_kfold, "HOME", tmp_path)
     monkeypatch.setattr(evaluate_kfold, "CNNBinaryClassifier", TinyClassifier)
@@ -540,14 +561,10 @@ def test_vindr_wide_mode_writes_both_labels(tmp_path, monkeypatch, ckpt_dir):
     _write_record(ckpt_dir, FOLD_BIASES, tau=0.7)
     manifests = tmp_path / "manifests"
     manifests.mkdir()
-    # Only the hash prefix of the temp dir is taken from this file; contents are unused.
-    (manifests / "vindr_wide.csv").write_text(
-        "image_id,split,label,label_any,n_readers,n_pos_votes\n", encoding="utf-8"
-    )
     wide = _fake_wide_manifest()
+    _freeze_manifest(manifests / "vindr_wide.csv", wide, "E2-wide manifest")
     monkeypatch.setattr(evaluate_kfold, "manifest_dir", lambda: manifests)
     monkeypatch.setattr(evaluate_kfold, "HOME", tmp_path)
-    monkeypatch.setattr(evaluate_kfold, "load_vindr_wide_manifest", lambda: wide)
     monkeypatch.setattr(evaluate_kfold, "CNNBinaryClassifier", TinyClassifier)
     captured = []
 

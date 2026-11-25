@@ -99,6 +99,42 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
+def load_frozen(path: Path) -> pd.DataFrame:
+    """Load an existing frozen manifest, verifying its hash; never build or repair.
+
+    Unlike :func:`load_or_create_frozen`, a missing csv, hash or creation record is
+    an error. Evaluation paths use this so a frozen cohort (e.g. the SIIM internal
+    holdout) is read from disk and can never be regenerated from current data.
+    """
+    path = Path(path)
+    hash_file = hash_path(path)
+    record_file = record_path(path)
+    missing = [
+        str(p.name) for p in (path, hash_file, record_file) if not p.exists()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Frozen manifest {path} is missing {missing}; it must exist together "
+            "with its .sha256 and .record.json and is never built at evaluation time."
+        )
+    expected = hash_file.read_text(encoding="utf-8").split()[0]
+    actual = sha256_file(path)
+    if actual != expected:
+        raise RuntimeError(
+            f"Frozen manifest hash mismatch for {path}: recorded {expected}, "
+            f"file is {actual}. The frozen file was modified; refusing to load it."
+        )
+    creation_record = json.loads(record_file.read_text(encoding="utf-8"))
+    recorded_csv = creation_record.get("csv_sha256")
+    if recorded_csv is not None and str(recorded_csv).strip().lower() != actual:
+        raise RuntimeError(
+            f"Frozen manifest creation record {record_file} names csv_sha256 "
+            f"{recorded_csv}, but the file is {actual}. Refusing to load a manifest "
+            "whose record and csv disagree."
+        )
+    return pd.read_csv(path, dtype=_id_dtypes(path))
+
+
 def load_or_create_frozen(
     path: Path,
     build_fn: Callable[[], pd.DataFrame],

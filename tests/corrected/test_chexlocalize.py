@@ -15,7 +15,7 @@ from PIL import Image
 
 from sharpness_matters.config.load_config import cfg
 from sharpness_matters.ptx.corrected import make_chexlocalize as mchx
-from sharpness_matters.ptx.corrected.frozen import record_path
+from sharpness_matters.ptx.corrected.frozen import hash_path, record_path, sha256_file
 from sharpness_matters.ptx.datasets.chexlocalize_dataset import (
     FINDING,
     CheXlocalizeDataset,
@@ -508,14 +508,44 @@ def test_frozen_manifests_are_written_then_loaded_first(tmp_path, monkeypatch):
 # --- saliency wrapper wiring ---
 
 
+def _freeze_xai_manifest(directory: Path) -> Path:
+    """Minimal frozen XAI artifact (csv + sha256 + record) accepted by `load_frozen`."""
+    csv_path = directory / eval_chx.XAI_MANIFEST_NAME
+    pd.DataFrame(
+        {
+            "image_id": ["patient1_study1_view1_frontal"],
+            "split": ["val"],
+            "patient_id": ["patient1"],
+            "path": ["val/patient1/study1/view1_frontal.jpg"],
+            "label": [1],
+        }
+    ).to_csv(csv_path, index=False)
+    digest = sha256_file(csv_path)
+    hash_path(csv_path).write_text(digest + "\n", encoding="utf-8")
+    record_path(csv_path).write_text(
+        json.dumps({"csv_sha256": digest, "item": "E4 XAI manifest"}),
+        encoding="utf-8",
+    )
+    return csv_path
+
+
 def test_saliency_wrapper_uses_xai_manifest_and_512(tmp_path, monkeypatch):
     captured = {}
+    manifest_csv = _freeze_xai_manifest(tmp_path)
+    frozen_frame = pd.read_csv(manifest_csv, dtype={"image_id": str})
 
     class _FakeDataset:
         def __init__(self, *args, **kwargs):
             captured["args"] = args
             captured["kwargs"] = kwargs
             self.with_mask = kwargs.get("with_mask")
+            self.image_ids = [str(value) for value in frozen_frame["image_id"]]
+            self.labels = {
+                str(image_id): int(label)
+                for image_id, label in zip(
+                    frozen_frame["image_id"], frozen_frame["label"]
+                )
+            }
 
     monkeypatch.setattr(eval_chx, "CheXlocalizeDataset", _FakeDataset)
     monkeypatch.setattr(eval_chx, "manifest_dir", lambda: tmp_path)

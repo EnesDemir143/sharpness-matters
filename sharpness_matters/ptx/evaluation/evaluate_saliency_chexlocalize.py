@@ -7,6 +7,10 @@
 #   `chexlocalize`, input size 512 only, reusing the same fold checkpoints, chunk
 #   cache, K1 / TP-conditional / joint summaries and hit/pixel-AUPRC columns.
 #   check: tests/corrected/test_chexlocalize.py::test_saliency_*
+# B (protocol Section 4.7 / 6.1): the XAI csv is read through `frozen.load_frozen`
+#   (hash + creation record checked) and the built cohort must match that frame, so a
+#   tampered or renamed manifest cannot be scored as the E4 XAI cohort.
+#   check: tests/corrected/test_manifest_eval_integrity.py
 
 Usage:
     python -m sharpness_matters.ptx.evaluation.evaluate_saliency_chexlocalize
@@ -22,7 +26,10 @@ import pytorch_lightning as pl
 import torch
 
 from sharpness_matters.config.load_config import cfg
-from sharpness_matters.ptx.corrected.frozen import manifest_dir
+from sharpness_matters.ptx.corrected.eval_manifests import (
+    verify_dataset_against_frozen,
+)
+from sharpness_matters.ptx.corrected.frozen import load_frozen, manifest_dir
 from sharpness_matters.ptx.datasets.chexlocalize_dataset import CheXlocalizeDataset
 from sharpness_matters.ptx.evaluation.evaluate_saliency import run_experiment
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
@@ -45,8 +52,15 @@ def build_dataset(
     annotations_dir: Optional[str] = None,
     chexpert_dir: Optional[str] = None,
 ) -> CheXlocalizeDataset:
-    """The frozen XAI cohort with native-grid masks, at one input size."""
+    """The frozen XAI cohort with native-grid masks, at one input size.
+
+    # B (Section 4.7 / 6.1): the XAI csv is hash/record-verified through
+    #   `frozen.load_frozen` before the dataset is built, so a tampered, missing or
+    #   sidecar-less manifest fails before any checkpoint is loaded. The manifest is
+    #   never generated here; a missing artifact raises.
+    """
     manifest_csv = manifest_dir() / XAI_MANIFEST_NAME
+    load_frozen(manifest_csv)
     return CheXlocalizeDataset(
         str(manifest_csv),
         int(img_size),
@@ -58,6 +72,24 @@ def build_dataset(
         if chexpert_dir is not None
         else cfg.ptx.chexlocalize.chexpert_dir,
     )
+
+
+def _verify_xai_cohort(dataset: object, manifest_csv: Path) -> None:
+    """Verify the frozen XAI artifact and require the cohort to be identifiable.
+
+    The canonical artifact is always loaded through `frozen.load_frozen`, even when a
+    caller injects a dataset: evaluation must never score an XAI cohort whose frozen
+    manifest is missing or tampered. The dataset must also expose the ``image_ids``/
+    ``labels`` contract and match that frame row-for-row; an unidentifiable dataset is
+    refused rather than scored under the frozen cohort's name.
+    """
+    frozen_frame = load_frozen(manifest_csv)
+    if not hasattr(dataset, "image_ids") or not hasattr(dataset, "labels"):
+        raise RuntimeError(
+            "CheXlocalize XAI dataset has no image_ids/labels; refusing to score an "
+            "unidentifiable cohort under the frozen manifests/chexlocalize_xai.csv"
+        )
+    verify_dataset_against_frozen(dataset, frozen_frame, what="CheXlocalize XAI cohort")
 
 
 def run_chexlocalize_saliency(
@@ -75,6 +107,7 @@ def run_chexlocalize_saliency(
             f"got img_size={img_size}"
         )
     cohort = dataset if dataset is not None else build_dataset(img_size=img_size)
+    _verify_xai_cohort(cohort, manifest_dir() / XAI_MANIFEST_NAME)
     output_root = Path(
         output_root if output_root is not None else f"{HOME}/output/saliency_eval"
     )
