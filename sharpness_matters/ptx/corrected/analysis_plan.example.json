@@ -1,6 +1,6 @@
 {
   "plan_version": 1,
-  "description": "Stage-2 (B) pre-registered statistics plan. TEMPLATE: every input path is a placeholder and must be replaced before lock_plan(); relative paths resolve against this file's directory. A family must be endpoint-homogeneous; classification AUROC comparisons use the classification endpoint and are never mixed with the XAI endpoints (localization, sanity, faithfulness). Every saliency_paired comparison also registers `p_method`, never leaving the choice to SciPy's `auto`: `approx` is the explicit normal approximation for large cohorts (more than 20 pairs, e.g. n=498), `permutation` is the exhaustive 2^n sign-flip test on the tie-averaged signed ranks for small continuous cohorts (n<=20 non-zero differences, requires zero_method wilcox), and `mcnemar_exact` is the two-sided exact binomial on the discordant pairs of a binary 0/1 hit metric. Both template cohorts below are SIIM holdout cohorts larger than 20 images, so both register `approx`. The last two families are the patient-level templates: `uncertainty_unit` = patient plus `inputs.patient_manifest` (a frozen image_id/patient_id manifest) resamples patients instead of images, and the saliency comparison then tests one mean difference per patient, so the CheXlocalize XAI cohort (15 patients) registers `permutation`.",
+  "description": "Stage-2 (B) pre-registered statistics plan. TEMPLATE: every input path is a placeholder and must be replaced before lock_plan(); relative paths resolve against this file's directory. A family must be endpoint-homogeneous; classification AUROC comparisons use the classification endpoint and are never mixed with the XAI endpoints (localization, sanity, faithfulness). Every saliency_paired comparison also registers `p_method`, never leaving the choice to SciPy's `auto`: `approx` is the explicit normal approximation for large cohorts (more than 20 pairs, e.g. n=498), `permutation` is the exhaustive 2^n sign-flip test on the tie-averaged signed ranks for small continuous cohorts (n<=20 non-zero differences, requires zero_method wilcox), and `mcnemar_exact` is the two-sided exact binomial on the discordant pairs of a binary 0/1 hit metric. Both template cohorts below are SIIM holdout cohorts larger than 20 images and the PTX-498 cohort is 498 pairs, so those image-unit comparisons register `approx`. The last two families are the patient-level templates: `uncertainty_unit` = patient plus `inputs.patient_manifest` (a frozen image_id/patient_id manifest) resamples patients instead of images, and the saliency comparison then tests one mean difference per patient, so the CheXlocalize XAI cohort (15 patients) registers `permutation`. Families cover E1 (SIIM holdout), E2 (VinDr: all 18,000 images, plus the 3,000-image official-test subset as a second comparison of the same prediction files), E3 (PTX-498 saliency localization) and E4 (CheXlocalize); the secondary E5 runs are outside the A↔B analysis and are not registered here.",
   "families": [
     {
       "name": "siim_k1_localization_iou_t050",
@@ -88,6 +88,122 @@
             "where": {}
           },
           "paired_difference": "b - a",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        }
+      ]
+    },
+    {
+      "name": "vindr_e2_classification_auroc",
+      "correction": "bh",
+      "alpha": 0.05,
+      "endpoint_class": "classification",
+      "description": "E2 (VinDr-CXR v1.0.0): the whole 18,000-image cohort of the `vindr_wide` mode - the 3,000-image official test split (5-radiologist consensus) plus the 15,000 train images (3 independent readers, no consensus; main label = at least 2 of 3 votes, 76 positives). `uncertainty_unit` image: VinDr DICOMs carry no patient identifier, so the image is the unit of analysis and of resampling and `p_clustering_aware` stays null.",
+      "comparisons": [
+        {
+          "id": "e2_auroc_vindr_wide_stage1_vs_stage2",
+          "kind": "classification_auroc",
+          "endpoint_class": "classification",
+          "description": "PLACEHOLDER paths: replace with the two ID-keyed `*_ids.csv` outputs of the `vindr_wide` mode (columns `image_id, source, split, label, label_any, prob`). The branches name the probability column differently, so `prob_column_a` = stage-1 `score` and `prob_column_b` = stage-2 `prob`; the main label is the `label` column.",
+          "inputs": {
+            "a": "outputs/classification/stage1_vindr_widepred_resnet_512_ids.csv",
+            "b": "outputs/classification/stage2_vindr_widepred_resnet_512_ids.csv",
+            "prob_column_a": "score",
+            "prob_column_b": "prob",
+            "label_column": "label"
+          },
+          "cohort": {
+            "description": "Whole E2 cohort: all 18,000 images (train + test splits of the wide manifest); both classes are required for AUROC.",
+            "where": {}
+          },
+          "paired_difference": "b - a",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        },
+        {
+          "id": "e2_auroc_vindr_official_test_stage1_vs_stage2",
+          "kind": "classification_auroc",
+          "endpoint_class": "classification",
+          "description": "PLACEHOLDER paths: the SAME two `vindr_wide` prediction CSVs as the whole-cohort comparison; only the cohort filter differs. The filter is applied to each side before ID alignment, so the pair stays the official-test subset of both branches.",
+          "inputs": {
+            "a": "outputs/classification/stage1_vindr_widepred_resnet_512_ids.csv",
+            "b": "outputs/classification/stage2_vindr_widepred_resnet_512_ids.csv",
+            "prob_column_a": "score",
+            "prob_column_b": "prob",
+            "label_column": "label"
+          },
+          "cohort": {
+            "description": "E2 official-test subset: `split == test` on the wide prediction CSV (3,000 images, 18 positives, 5-radiologist consensus label); both classes are required for AUROC.",
+            "where": {
+              "split": "test"
+            }
+          },
+          "paired_difference": "b - a",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        },
+        {
+          "id": "e2_auroc_vindr_wide_label_any_stage1_vs_stage2",
+          "kind": "classification_auroc",
+          "endpoint_class": "classification",
+          "description": "PLACEHOLDER paths: the SAME two `vindr_wide` prediction CSVs; only `label_column` changes. Sensitivity rule `label_any` (train = at least 1 of 3 reader votes; test = consensus; 114 positives) is the pre-registered sensitivity row of E2 - one prediction set, two label definitions - not a separate experiment.",
+          "inputs": {
+            "a": "outputs/classification/stage1_vindr_widepred_resnet_512_ids.csv",
+            "b": "outputs/classification/stage2_vindr_widepred_resnet_512_ids.csv",
+            "prob_column_a": "score",
+            "prob_column_b": "prob",
+            "label_column": "label_any"
+          },
+          "cohort": {
+            "description": "Whole E2 cohort under the sensitivity label: all 18,000 images; both classes are required for AUROC.",
+            "where": {}
+          },
+          "paired_difference": "b - a",
+          "uncertainty_unit": "image",
+          "bootstrap": {
+            "n": 2000,
+            "seed": 42
+          }
+        }
+      ]
+    },
+    {
+      "name": "ptx498_e3_localization_iou_t050",
+      "correction": "bh",
+      "alpha": 0.05,
+      "endpoint_class": "localization",
+      "description": "E3 (PTX-498): saliency localization on the K1 cohort - every GT-positive image of the 498, decision independent - with paired IoU at threshold 0.50 (main fold rule). `uncertainty_unit` image: per the dataset authors PTX-498 holds 498 patients and 498 images (one image per patient), so image-level resampling does not repeat a patient.",
+      "comparisons": [
+        {
+          "id": "e3_iou_t050_ptx498_stage1_vs_stage2",
+          "kind": "saliency_paired",
+          "endpoint_class": "localization",
+          "description": "PLACEHOLDER paths: replace with the two ID-keyed per-image saliency CSVs of the PTX-498 K1 cohort (`saliency_{dataset}_{model}_{img_size}_{rule}.csv` per branch). Paired IoU at threshold 0.50, the main fold rule. p_method approx: the cohort is 498 pairs, well above 20, so the registered p-value is the explicit normal approximation on the signed ranks.",
+          "inputs": {
+            "a": "outputs/saliency/saliency_ptx498_ood_stage1_resnet_512_main.csv",
+            "b": "outputs/saliency/saliency_ptx498_ood_stage2_resnet_512_main.csv",
+            "metric_column": "iou",
+            "threshold": {
+              "column": "threshold",
+              "value": 0.5
+            }
+          },
+          "cohort": {
+            "description": "K1: the score CSV is keyed by exactly the GT-positive PTX-498 image set, so no extra row filter is applied.",
+            "where": {}
+          },
+          "paired_difference": "b - a",
+          "zero_method": "wilcox",
+          "p_method": "approx",
           "uncertainty_unit": "image",
           "bootstrap": {
             "n": 2000,

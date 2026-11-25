@@ -207,15 +207,97 @@ def test_example_plan_validates():
     assert [item["name"] for item in plan["families"]] == [
         "siim_k1_localization_iou_t050",
         "siim_classification_auroc",
+        "vindr_e2_classification_auroc",
+        "ptx498_e3_localization_iou_t050",
         "chexlocalize_e4_localization_iou_patient",
         "chexlocalize_e4_classification_auroc_patient",
     ]
     assert [item["endpoint_class"] for item in plan["families"]] == [
         "localization",
         "classification",
+        "classification",
+        "localization",
         "localization",
         "classification",
     ]
+
+
+def test_example_plan_families_validate_one_by_one():
+    payload = json.loads(EXAMPLE_PLAN.read_text(encoding="utf-8"))
+    for registered_family in payload["families"]:
+        validate_plan(
+            {"plan_version": payload["plan_version"], "families": [registered_family]}
+        )
+
+
+def test_example_plan_registers_e2_wide_and_official_test_subset():
+    plan = validate_plan(json.loads(EXAMPLE_PLAN.read_text(encoding="utf-8")))
+    e2 = next(
+        item for item in plan["families"] if item["name"] == "vindr_e2_classification_auroc"
+    )
+    assert e2["endpoint_class"] == "classification"
+    assert {item["kind"] for item in e2["comparisons"]} == {"classification_auroc"}
+    # Both branches name the probability column differently (stage-1 `score` vs
+    # stage-2 `prob`), and the whole 18,000-image cohort uses no row filter.
+    main = [
+        item for item in e2["comparisons"] if item["inputs"]["label_column"] == "label"
+    ]
+    whole = [item for item in main if item["cohort"]["where"] == {}]
+    subset = [item for item in main if item["cohort"]["where"] == {"split": "test"}]
+    assert len(whole) == 1 and len(subset) == 1
+    for item in main:
+        assert item["inputs"]["prob_column_a"] == "score"
+        assert item["inputs"]["prob_column_b"] == "prob"
+    # The official-test comparison is the SAME wide prediction CSV, filtered on split.
+    assert subset[0]["inputs"]["a"] == whole[0]["inputs"]["a"]
+    assert subset[0]["inputs"]["b"] == whole[0]["inputs"]["b"]
+    # The ≥1-reader sensitivity rule is registered through `label_column`, over the
+    # whole cohort: same predictions, only the label definition changes.
+    sensitivity = [
+        item
+        for item in e2["comparisons"]
+        if item["inputs"]["label_column"] == "label_any"
+    ]
+    assert len(sensitivity) == 1
+    assert sensitivity[0]["cohort"]["where"] == {}
+    # VinDr DICOMs carry no patient ID: the image is the resampling unit everywhere.
+    assert all(item["uncertainty_unit"] == "image" for item in e2["comparisons"])
+    assert all(item["inputs"]["patient_manifest"] is None for item in e2["comparisons"])
+
+
+def test_example_plan_registers_e3_ptx498_localization():
+    plan = validate_plan(json.loads(EXAMPLE_PLAN.read_text(encoding="utf-8")))
+    e3 = next(
+        item
+        for item in plan["families"]
+        if item["name"] == "ptx498_e3_localization_iou_t050"
+    )
+    assert e3["endpoint_class"] == "localization"
+    (comparison,) = e3["comparisons"]
+    assert comparison["kind"] == "saliency_paired"
+    assert comparison["p_method"] == "approx"
+    assert comparison["uncertainty_unit"] == "image"
+    assert comparison["inputs"]["metric_column"] == "iou"
+    assert comparison["inputs"]["threshold"] == {"column": "threshold", "value": 0.5}
+    assert comparison["inputs"]["patient_manifest"] is None
+
+
+def test_example_plan_registers_no_secondary_run_family():
+    plan = validate_plan(json.loads(EXAMPLE_PLAN.read_text(encoding="utf-8")))
+    texts = []
+    for registered_family in plan["families"]:
+        texts.extend(
+            [registered_family["name"], registered_family.get("description") or ""]
+        )
+        for comparison in registered_family["comparisons"]:
+            texts.extend(
+                [
+                    comparison["id"],
+                    comparison.get("description") or "",
+                    comparison["cohort"].get("description") or "",
+                ]
+            )
+    assert not any("E5" in text for text in texts)
 
 
 def test_unknown_key_rejected():
