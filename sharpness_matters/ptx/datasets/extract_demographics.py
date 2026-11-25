@@ -40,6 +40,7 @@ from sharpness_matters.config.load_config import cfg
 logger = initialize_logger(level="info")
 HOME = Path(__file__).resolve().parent.parent
 SIIM_ROOT_DIR = cfg.ptx.siim_acr.root_dir
+SIIM_TRAIN_DICOM_SUBDIR = "dicom-images-train"
 VINDR_ROOT_DIR = cfg.ptx.vindr.root_dir
 
 
@@ -563,16 +564,18 @@ def load_siim_dataset(split: str = "test") -> Any:
     Returns:
         Any: ChestXrayDataset instance
     """
-    # Default paths for SIIM-ACR dataset - you may need to adjust these
-    dicom_dir = SIIM_ROOT_DIR
+    # B (Section 10.3 / Y10): the archive may hold a second, nested copy of itself
+    #   (`<root>/pneumothorax/dicom-images-train`). A recursive scan from the root
+    #   maps every ImageId to two files and the ambiguity check rejects the cohort,
+    #   so only the top-level `dicom-images-train/<study>/<series>/<id>.dcm` tree
+    #   is indexed, the same pattern the training and evaluation paths use.
+    #   check: tests/corrected/test_demographics_siim.py
+    dicom_dir = os.path.join(SIIM_ROOT_DIR, SIIM_TRAIN_DICOM_SUBDIR)
     label_dir = os.path.join(SIIM_ROOT_DIR, "train-rle.csv")
 
-    # Get all DICOM files
     import glob
 
-    file_paths = glob.glob(os.path.join(dicom_dir, "**/*.dcm"), recursive=True)
-    if not file_paths:
-        file_paths = glob.glob(os.path.join(dicom_dir, "**/*.dicom"), recursive=True)
+    file_paths = sorted(glob.glob(os.path.join(dicom_dir, "*", "*", "*.dcm")))
 
     if not file_paths:
         raise FileNotFoundError(f"No DICOM files found in {dicom_dir}")
