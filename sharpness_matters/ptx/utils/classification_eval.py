@@ -162,10 +162,11 @@ def binary_classification_metrics(
 
     Protocol §4.4 reports classification AUPRC together with prevalence, and
     sensitivity/specificity at the baseline's fixed transfer threshold. This helper is
-    the single implementation of those cells for the primary label of every cohort
-    (E1/E2/E2-wide/E4/E5): the inputs are the existing ensemble probabilities and the
-    run's OOF `tau`. Because `tau` is the OOF-locked target-sensitivity threshold,
-    `specificity` here is also the protocol's specificity at that operating point.
+    the single implementation of those cells for the primary label of every B cohort
+    (E1 holdout, E2 `vindr_test`/`vindr_wide`, E4): the inputs are the existing ensemble
+    probabilities and the run's OOF `tau`. Because `tau` is the OOF-locked
+    target-sensitivity threshold, `specificity` here is also the protocol's specificity
+    at that operating point.
 
     AUPRC convention: `sklearn.metrics.average_precision_score`, i.e. step-wise average
     precision (each change in recall contributes the precision at that operating

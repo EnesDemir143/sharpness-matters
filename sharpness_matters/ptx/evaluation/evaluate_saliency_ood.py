@@ -17,8 +17,8 @@ B (PTX-04 / §7.4): one CSV and one JSON summary per (model, img_size, dataset, 
 scored for every GT-positive image from its positive-class CAM, independent of the decision.
 B (protocol §6): B evaluates input size 512 only; `train_kfold.main` and `evaluate_kfold` use
 [512] and a cv record exists only for 512, so the author's 64..1024 sweep is not run here.
-This script evaluates PTX-498 only (`OODTestDataset`); it never constructs `VinDataset`, so the
-E5 manifest (`manifest_csv`) is not a parameter of this entry point.
+E3 evaluates PTX-498 only (`OODTestDataset`); it never constructs `VinDataset`, so the E5
+manifests (evaluated by run A only) are not an input of this entry point.
 
 Usage:
     Run this module directly to execute the experiments:

@@ -23,13 +23,13 @@ predictions are saved keyed by ImageId for further analysis.
 #   check: tests/corrected/test_e2_e4_eval.py::test_vindr_test_mode_writes_id_csv,
 #   ::test_chexlocalize_mode_keeps_split_and_patient_id,
 #   ::test_cli_help_lists_e2_e4_modes
-# B (§4.4 E2-wide, secondary row): current -> a single prediction file could only carry
-#   E2's one consensus label. New -> `vindr_wide` evaluates the frozen train+test wide
-#   manifest as one ConcatDataset (train root, test root) and writes both pre-registered
-#   labels (`label`, `label_any`) with the prediction, so the sensitivity AUROC comes
-#   from the same predictions under `sensitivity_label_any` instead of a second model
-#   run. The per-split `image_id,label` csv files the loader needs are temporary views
-#   of the frozen manifest and are never frozen themselves.
+# B (§4.4 E2, `vindr_wide`): E2 covers all 18,000 VinDr images and `vindr_test` is its
+#   official-test subset. `vindr_wide` evaluates the frozen train+test wide manifest as
+#   one ConcatDataset (train root, test root) and writes both pre-registered labels
+#   (`label`, `label_any`) with the prediction, so the sensitivity AUROC comes from the
+#   same predictions under `sensitivity_label_any` instead of a second model run. The
+#   per-split `image_id,label` csv files the loader needs are temporary views of the
+#   frozen manifest and are never frozen themselves.
 #   check: tests/corrected/test_e2_e4_eval.py::test_vindr_wide_mode_writes_both_labels,
 #   ::test_vindr_wide_sensitivity_auroc_uses_same_predictions
 
@@ -43,8 +43,8 @@ predictions are saved keyed by ImageId for further analysis.
 # Usage:
     Run this module directly:
         python3 evaluate_kfold.py --validation_mode=<validation_dataset>
-        python3 evaluate_kfold.py --validation_mode=vindr_test   # E2
-        python3 evaluate_kfold.py --validation_mode=vindr_wide   # E2-wide (secondary)
+        python3 evaluate_kfold.py --validation_mode=vindr_test   # E2 official-test subset
+        python3 evaluate_kfold.py --validation_mode=vindr_wide   # E2 all 18,000 images
         python3 evaluate_kfold.py --validation_mode=chexlocalize  # E4
     Output CSV files with evaluation metrics for each model will be saved in
     'classification_{model_name}_{validation_mode}.csv'.
@@ -105,7 +105,7 @@ DATA_DIR = cfg.ptx.siim_acr.root_dir
 HOME = Path(__file__).resolve().parent.parent
 logger.debug(f"Output Root: {HOME}")
 
-# Manifest names come from their builders (single source of truth, §4.4 E2/E2-wide/E4).
+# Manifest names come from their builders (single source of truth, §4.4 E2/E4).
 VALIDATION_MODES = (
     "holdout",
     "vindr_test",
@@ -179,7 +179,7 @@ def fetch_results_per_resolution(
             `sensitivity_label_any` AUROC block computed from the same predictions.
     """
     # Extra ID-keyed prediction columns as (insert position, name, values); position
-    # None appends. The E2-wide row pins split/label_any between source and label.
+    # None appends. `vindr_wide` pins split/label_any between source and label.
     extra_columns: List[Tuple[Optional[int], str, list]] = []
     label_any_labels: Optional[np.ndarray] = None
     record_for_eval: Optional[Dict[str, Any]] = None
@@ -233,8 +233,8 @@ def fetch_results_per_resolution(
             )
         sources = ["siim_acr"] * len(ids)
     elif validation_mode == "vindr_test":
-        # B (§4.4 E2): official test split only; no PTX-498 images are mixed in, so the
-        # positives and negatives come from the same validated VinDr cohort.
+        # B (§4.4 E2): the official-test subset of E2 only; no PTX-498 images are mixed
+        # in, so the positives and negatives come from the same validated VinDr cohort.
         manifest_csv = manifest_dir() / VINDR_TEST_MANIFEST
         frozen_test = load_frozen(manifest_csv)
         dataset = VinDataset(
@@ -270,17 +270,18 @@ def fetch_results_per_resolution(
         ]
         sources = [f"chexlocalize_{split}" for split in cohort["split"]]
     elif validation_mode == "vindr_wide":
-        # B (§4.4 E2-wide): secondary row next to E2. One frozen wide manifest carries
-        # both pre-registered labels; VinDataset needs one ID+label csv per root, so the
-        # per-split views are written to a temporary dir (never frozen separately) and
-        # removed once the datasets have parsed them.
+        # B (§4.4 E2): E2 covers all 18,000 VinDr images; `vindr_test` is its
+        # official-test subset. One frozen wide manifest carries both pre-registered
+        # labels; VinDataset needs one ID+label csv per root, so the per-split views are
+        # written to a temporary dir (never frozen separately) and removed once the
+        # datasets have parsed them.
         manifest_csv = manifest_dir() / VINDR_WIDE_MANIFEST
         wide = load_frozen(manifest_csv)
         missing_wide = set(VINDR_WIDE_COLUMNS) - set(wide.columns)
         if missing_wide:
             raise KeyError(
                 f"{manifest_csv} is missing columns {sorted(missing_wide)}; the "
-                "frozen E2-wide manifest must carry both labels and split"
+                "frozen vindr_wide manifest must carry both labels and split"
             )
         split_dir = Path(
             tempfile.mkdtemp(prefix=f"vindr_wide_{sha256_file(manifest_csv)[:12]}_")
@@ -394,12 +395,12 @@ def fetch_results_per_resolution(
         index=False,
     )
     if label_any_labels is not None:
-        # §4.4 E2-wide: the sensitivity row reuses the SAME ensemble predictions; only
-        # the label definition changes (>= 1 reader vote), so the model is not re-run.
+        # §4.4 E2: the sensitivity row reuses the SAME ensemble predictions; only the
+        # label definition changes (>= 1 reader vote), so the model is not re-run.
         if len(np.unique(label_any_labels)) < 2:
             raise RuntimeError(
-                "sensitivity_label_any AUROC is undefined: the E2-wide cohort has one "
-                "class under the any-vote rule"
+                "sensitivity_label_any AUROC is undefined: the vindr_wide cohort has "
+                "one class under the any-vote rule"
             )
         any_probs = pred_df["prob"].to_numpy().astype(np.float64)
         ci_low, ci_high = auroc_confidence_interval(label_any_labels, any_probs)

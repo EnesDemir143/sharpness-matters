@@ -1,6 +1,7 @@
-"""Stage-2 (B) E2 (VinDr official test) and E4 (CheXlocalize) evaluation tests.
+"""Stage-2 (B) E2 (VinDr-CXR) and E4 (CheXlocalize) evaluation tests.
 
-Synthetic only. The VinDr manifest builder is exercised on a hand-written
+E2 covers all 18,000 VinDr images (`vindr_wide`); `vindr_test` is its official-test
+subset. Synthetic only. The VinDr manifest builder is exercised on a hand-written
 `image_labels_test.csv` plus empty `.dicom` files; the evaluator paths run against a
 tiny LightningModule, a hand-written `cv_record.json` and fake datasets, so no real
 image, label file or model weight is needed.
@@ -272,7 +273,7 @@ def test_vindr_test_manifest_missing_dicom_raises(tmp_path):
     assert "b" in str(error.value)
 
 
-# ------------------------------------------------------------------ E2-wide manifest
+# ---------------------------------- E2 all-18,000-image manifest (`vindr_wide`)
 
 WIDE_TRAIN_VOTES = {
     "majority_pos": [1, 1, 0],  # 2 votes -> label 1, label_any 1
@@ -415,7 +416,7 @@ def test_vindr_test_mode_writes_id_csv(tmp_path, monkeypatch, ckpt_dir):
     monkeypatch.setattr(evaluate_kfold, "VinDataset", fake_vin)
     monkeypatch.setattr(evaluate_kfold, "CNNBinaryClassifier", TinyClassifier)
 
-    # E2 needs no --e5_manifest: the cohort comes from the frozen VinDr test manifest.
+    # E2 reads its cohort from the frozen VinDr official-test manifest (`vindr_test`).
     metrics = evaluate_kfold.fetch_results_per_resolution(
         IMG_SIZE, MODEL_NAME, "vindr_test"
     )
@@ -532,7 +533,7 @@ def test_chexlocalize_manifest_order_mismatch_raises(tmp_path):
         evaluate_kfold._chexlocalize_cohort_columns(manifest_csv, IDS)
 
 
-# ------------------------------------------------------------------ E2-wide eval path
+# --------------------------- E2 wide eval path (all 18,000 images, `vindr_wide`)
 
 WIDE_LOGIT_BY_ID = {
     "majority_pos": 2.0,

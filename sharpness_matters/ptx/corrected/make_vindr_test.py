@@ -1,4 +1,7 @@
-"""E2 VinDr-CXR v1.0.0 official-test manifest (Section 4.4, row E2).
+"""E2 VinDr-CXR v1.0.0 manifests (Section 4.4, row E2).
+
+E2 covers all 18,000 VinDr images (`manifests/vindr_wide.csv`, train + test);
+`manifests/vindr_test.csv` is the official-test subset of the same row.
 
 # B (§4.4 E2): the author's only VinDr cohort is the `.txt` ID selection of E5, with no
 #   source, split or label file of its own; the official test split was never used and
@@ -12,7 +15,7 @@
 #   ::test_vindr_test_manifest_duplicate_image_id_raises,
 #   ::test_vindr_test_manifest_non_binary_label_raises,
 #   ::test_vindr_test_manifest_missing_dicom_raises
-# B (§4.4 E2-wide, secondary row next to E2): current -> only the 3,000-image official
+# B (§4.4 E2, wide cohort = all 18,000 images): current -> only the 3,000-image official
 #   test split was turned into a frozen cohort, leaving the 45,000-row train label file
 #   (3 readers per image) unused and the pre-registered vote rules unimplemented. New:
 #   `manifests/vindr_wide.csv` covers train + test with `label` (train >= 2 of 3 reader
@@ -222,7 +225,7 @@ def load_vindr_test_manifest() -> pd.DataFrame:
     return frame
 
 
-# ------------------------------------------------------------------------- E2-wide
+# ------------------------------------- E2 wide cohort (all 18,000 images)
 
 
 def _wide_train_rows(train_labels_csv: Path) -> pd.DataFrame:
@@ -297,7 +300,7 @@ def build_vindr_wide_manifest(
     train_root: Union[str, Path],
     test_root: Union[str, Path],
 ) -> pd.DataFrame:
-    """Return the E2-wide manifest (train then test) with both pre-registered labels.
+    """Return the E2 wide manifest (train then test, all 18,000 images) with both labels.
 
     ``label`` is the MAIN rule (train: >= 2 of 3 reader votes; test: consensus) and
     ``label_any`` the SENSITIVITY rule (train: >= 1 vote, the author's E5 positive
@@ -398,13 +401,14 @@ def load_vindr_wide_manifest() -> pd.DataFrame:
 @click.option(
     "--wide",
     is_flag=True,
-    help="Build/load the E2-wide train+test manifest (manifests/vindr_wide.csv)",
+    help="Build/load the E2 wide train+test manifest, all 18,000 images "
+    "(manifests/vindr_wide.csv)",
 )
 def main(wide: bool) -> None:
     """Build-and-freeze (first run) or load-and-verify an E2 manifest.
 
     Default: manifests/vindr_test.csv (official test split, row E2). With ``--wide``:
-    manifests/vindr_wide.csv (train + test, E2-wide main and sensitivity labels).
+    manifests/vindr_wide.csv (all 18,000 images, main and sensitivity labels).
     """
     if wide:
         frame = load_vindr_wide_manifest()

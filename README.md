@@ -149,8 +149,8 @@ uv run python -m sharpness_matters.ptx.corrected.e5_multidraw --base-seed 0 --dr
 
 **5b. E2 and E4 manifests:** VinDr-CXR v1.0.0 official test (PhysioNet `image_labels_test.csv` + `test/*.dicom`) → `manifests/vindr_test.csv`; CheXlocalize (CheXpert val/test images + label CSVs + `gt_segmentations_*.json`) → `manifests/chexlocalize_cls.csv`, `manifests/chexlocalize_xai.csv`.
 ```bash
-uv run python -m sharpness_matters.ptx.corrected.make_vindr_test          # E2: official test, 5-radiologist consensus (needs test/*.dicom)
-uv run python -m sharpness_matters.ptx.corrected.make_vindr_test --wide   # E2-wide (secondary): all 18,000 images; train part majority >=2/3 readers, sensitivity label >=1/3 (needs train/ + test/)
+uv run python -m sharpness_matters.ptx.corrected.make_vindr_test          # E2 official-test subset: 5-radiologist consensus (needs test/*.dicom)
+uv run python -m sharpness_matters.ptx.corrected.make_vindr_test --wide   # E2 all 18,000 images: train part majority >=2/3 readers, sensitivity label >=1/3 (needs train/ + test/)
 uv run python -m sharpness_matters.ptx.corrected.make_chexlocalize        # E4 (needs CheXpert val/test images + label CSVs)
 ```
 
@@ -171,9 +171,9 @@ uv run python -m sharpness_matters.ptx.train.train_kfold --model_name resnet
 **8. Classification evaluation (ID-keyed predictions, decision `p >= τ`):** E5 is not evaluated on B (run A owns it — decision of 25 Kasım 2026), so no E5 mode or `--e5_manifest` option exists.
 ```bash
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode holdout
-uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_test     # E2
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_test     # E2 official-test subset
 uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode chexlocalize   # E4 classification
-uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_wide     # E2-wide (+ label_any sensitivity AUROC)
+uv run python -m sharpness_matters.ptx.evaluation.evaluate_kfold --validation_mode vindr_wide     # E2 all 18,000 images (+ label_any sensitivity AUROC)
 ```
 
 **9. Saliency evaluation (GT kept on its reference grid; decision-independent K1 cohort):**
