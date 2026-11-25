@@ -9,7 +9,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from scipy.stats import norm
 import scipy.stats as st
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
 from tqdm import tqdm
 from typing import Any, Dict, List, Optional, Tuple, Union, Type
 from sharpness_matters.ptx.corrected.cv_record import fold_checkpoints, load_cv_record
@@ -33,6 +39,12 @@ from sharpness_matters.ptx.corrected.cv_record import fold_checkpoints, load_cv_
 #   (`image_id,label,prob,prob_fold0..k`) in dataset order, verified against the
 #   dataset-order labels. check: ::test_output_id_order_matches_input,
 #   ::test_label_misalignment_raises
+# B (protocol §4.4 classification): current -> only acc/auc/f1 at tau; new -> AUPRC
+#   (sklearn average precision, the same convention as pixel-AUPRC), sensitivity and
+#   specificity at `p >= tau`, prevalence and class counts, all from the existing OOF
+#   tau and ensemble probabilities. A single-class cohort reports AUROC/AUPRC and the
+#   undefined rate as `None`, never a fabricated value.
+#   check: tests/corrected/test_classification_metrics_extra.py
 
 
 def _sha256(path: str) -> str:
@@ -54,8 +66,19 @@ def auroc_confidence_interval(
         confidence (float): Confidence level (default: 0.95).
         n_bootstrap (int): Number of bootstrap samples (default: 1000).
     Returns:
-        (float, float): Lower and upper bounds of the AUROC confidence interval.
+        (float, float): Lower and upper bounds of the AUROC confidence interval, or
+        `(None, None)` when AUROC is undefined (a single-class input, or no bootstrap
+        resample retained both classes). No fabricated interval is returned.
     """
+    y_true = np.asarray(y_true).reshape(-1)
+    y_scores = np.asarray(y_scores, dtype=np.float64).reshape(-1)
+    if y_true.shape != y_scores.shape:
+        raise ValueError(
+            f"labels and scores must have the same length, got {y_true.size} and "
+            f"{y_scores.size}"
+        )
+    if y_true.size == 0 or np.unique(y_true).size < 2:
+        return None, None
     bootstrapped_aurocs = []
     n = len(y_true)
     # Perform bootstrapping
@@ -64,6 +87,8 @@ def auroc_confidence_interval(
         if len(np.unique(y_true[indices])) < 2:
             continue  # Skip if there's only one class in the resampled data
         bootstrapped_aurocs.append(roc_auc_score(y_true[indices], y_scores[indices]))
+    if not bootstrapped_aurocs:
+        return None, None
     # Compute confidence interval from percentiles
     lower_percentile = (1 - confidence) / 2 * 100
     upper_percentile = (1 + confidence) / 2 * 100
@@ -112,6 +137,109 @@ def delong_roc_test(y_true: np.ndarray, scores1: np.ndarray, scores2: np.ndarray
     z_stat = diff / np.sqrt(var)
     p_value = 2 * (1 - norm.cdf(abs(z_stat)))
     return z_stat, p_value
+
+
+def _ratio(numerator: int, denominator: int) -> Optional[float]:
+    """`numerator / denominator`, or `None` when the denominator is empty."""
+    if denominator == 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _rounded(value: Optional[float], digits: int = 4) -> Optional[float]:
+    """Round a metric to `digits`, preserving `None` (undefined) as `None`."""
+    if value is None:
+        return None
+    return float(np.round(float(value), digits))
+
+
+def binary_classification_metrics(
+    labels: Union[np.ndarray, List[int]],
+    probs: Union[np.ndarray, List[float]],
+    tau: float,
+) -> Dict[str, Any]:
+    """Binary metrics at `p >= tau`, plus threshold-free AUPRC and prevalence.
+
+    Protocol §4.4 reports classification AUPRC together with prevalence, and
+    sensitivity/specificity at the baseline's fixed transfer threshold. This helper is
+    the single implementation of those cells for the primary label of every cohort
+    (E1/E2/E2-wide/E4/E5): the inputs are the existing ensemble probabilities and the
+    run's OOF `tau`. Because `tau` is the OOF-locked target-sensitivity threshold,
+    `specificity` here is also the protocol's specificity at that operating point.
+
+    AUPRC convention: `sklearn.metrics.average_precision_score`, i.e. step-wise average
+    precision (each change in recall contributes the precision at that operating
+    point). It is *not* the trapezoidal area under the precision-recall curve
+    (`sklearn.metrics.auc(recall, precision)`): AP is step-wise, while the trapezoidal
+    area linearly interpolates between operating points, so the two can differ even
+    without tied scores; ties are one further source of divergence. This matches the
+    pixel-AUPRC convention in `saliency_eval`. Tied scores are evaluated together at one
+    threshold, so no tie-breaking rule is invented.
+
+    Undefined cells are `None`, never a fabricated number:
+    - `auc` and `auprc` need both classes. A single-class cohort has no ranking, and an
+      all-positive AUPRC is degenerate (precision is 1 at every recall), so it is not
+      reported as 1.0.
+    - `sensitivity` needs at least one positive; `specificity` needs at least one
+      negative.
+    - `prevalence = n_pos / N` is always defined and finite.
+
+    Args:
+        labels: Binary ground-truth labels (`0`/`1`) in dataset order.
+        probs: The same samples' ensemble probabilities in dataset order.
+        tau: Decision threshold; a sample is positive when `prob >= tau` (inclusive).
+
+    Returns:
+        dict with `acc`, `auc`, `f1`, `auprc`, `sensitivity`, `specificity`,
+        `prevalence`, `n_pos`, `n_neg`. Values are unrounded floats/int; `None` marks
+        a structurally undefined metric.
+
+    Raises:
+        ValueError: empty input, length mismatch, non-finite probabilities or tau, or
+            labels outside {0, 1}.
+    """
+    raw_labels = np.asarray(labels).reshape(-1)
+    probabilities = np.asarray(probs, dtype=np.float64).reshape(-1)
+    if raw_labels.shape != probabilities.shape:
+        raise ValueError(
+            f"labels and probs must have the same length, got {raw_labels.size} and "
+            f"{probabilities.size}"
+        )
+    if raw_labels.size == 0:
+        raise ValueError("cannot compute classification metrics from empty input")
+    if not np.isfinite(probabilities).all():
+        raise ValueError("probabilities must be finite")
+    if not np.isin(raw_labels, (0, 1)).all():
+        raise ValueError("labels must be binary {0, 1}")
+    tau = float(tau)
+    if not np.isfinite(tau):
+        raise ValueError(f"tau must be finite, got {tau}")
+    y_true = raw_labels.astype(int)
+    n_pos = int(np.count_nonzero(y_true == 1))
+    n_neg = int(y_true.size - n_pos)
+    decision = probabilities >= tau
+    true_positives = int(np.count_nonzero(decision & (y_true == 1)))
+    true_negatives = int(np.count_nonzero(~decision & (y_true == 0)))
+    # Both classes are required for a ranking metric. A single-class cohort has no
+    # negative/positive contrast, so no AUROC or AUPRC is fabricated.
+    both_classes = n_pos > 0 and n_neg > 0
+    auc = float(roc_auc_score(y_true, probabilities)) if both_classes else None
+    auprc = (
+        float(average_precision_score(y_true, probabilities))
+        if both_classes
+        else None
+    )
+    return {
+        "acc": float(accuracy_score(y_true, decision)),
+        "auc": auc,
+        "f1": float(f1_score(y_true, decision, zero_division=0)),
+        "auprc": auprc,
+        "sensitivity": _ratio(true_positives, n_pos),
+        "specificity": _ratio(true_negatives, n_neg),
+        "prevalence": float(n_pos) / float(y_true.size),
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+    }
 
 
 # Evaluation function for a single fold
@@ -206,6 +334,8 @@ def eval_res(
     Loads each fold's best checkpoint from the run's cv record, collects sigmoid
     probabilities and labels, computes per-fold (acc, auc, f1) and ensemble metrics by
     averaging sigmoid probabilities across folds, and returns ID-keyed predictions.
+    Ensemble metrics include threshold-free AUPRC and sensitivity/specificity at the
+    run's OOF `tau`; see `binary_classification_metrics` for the exact conventions.
     Parameters
     ----------
     dataset : torch.utils.data.Dataset
@@ -232,7 +362,10 @@ def eval_res(
         Columns `image_id,label,prob,prob_fold0..prob_foldk-1` in dataset order;
         `prob` is the mean of the fold sigmoid probabilities.
     ensemble_metrics : dict
-        Dict with keys: 'acc', 'auc', 'f1', 'auroc_ci', 'tau'.
+        Dict with keys: 'acc', 'auc', 'f1', 'auprc', 'sensitivity', 'specificity',
+        'prevalence', 'n_pos', 'n_neg', 'auroc_ci', 'tau'. A metric that is
+        structurally undefined for a single-class cohort is `None`, not NaN or a
+        fabricated value.
     """
     ids = [str(image_id) for image_id in ids]
     if len(ids) != len(dataset):
@@ -306,44 +439,69 @@ def eval_res(
         fold_probs.append(probs)
         fold_labels.append(fold_label)
         fold_preds = (probs >= tau).astype(int)
-        acc = accuracy_score(fold_label, fold_preds)
-        auc = roc_auc_score(fold_label, probs)
-        f1 = f1_score(fold_label, fold_preds)
-        metrics["acc"].append(acc)
-        metrics["auc"].append(auc)
-        metrics["f1"].append(f1)
+        fold_scores = {
+            "acc": float(accuracy_score(fold_label, fold_preds)),
+            "auc": (
+                float(roc_auc_score(fold_label, probs))
+                if np.unique(fold_label).size == 2
+                else None
+            ),
+            "f1": float(f1_score(fold_label, fold_preds, zero_division=0)),
+        }
+        # A fold whose validation slice happens to be single-class has no AUROC; it is
+        # skipped from that fold mean instead of aborting the whole evaluation.
+        for key in metrics:
+            if fold_scores[key] is not None:
+                metrics[key].append(fold_scores[key])
         logger.debug(
             f"Fold {fold} confusion matrix at tau={tau}: "
             f"{confusion_matrix(fold_label, fold_preds).tolist()}"
         )
-    # Compute average metrics from all folds
+    # Compute average metrics from all folds (None when every fold was undefined)
     for key in metrics:
-        metrics[key] = np.round(np.mean(metrics[key]), 4)
+        metrics[key] = _rounded(np.mean(metrics[key])) if metrics[key] else None
     # Section 6.2 (decision A): the ensemble is the mean of the fold sigmoid
     # probabilities, exactly as the author; logits are never averaged.
     all_probs_ensemble = np.mean(fold_probs, axis=0)
     all_labels = fold_labels[0]
-    # Compute ensemble metrics at the baseline's own threshold
+    # Protocol §4.4: all classification cells come from the same ensemble
+    # probabilities and the run's own OOF tau.
+    scores = binary_classification_metrics(all_labels, all_probs_ensemble, tau)
     all_preds = (all_probs_ensemble >= tau).astype(int)
-    accuracy = accuracy_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs_ensemble)
-    f1 = f1_score(all_labels, all_preds)
     cm = confusion_matrix(all_labels, all_preds)
-    ci = auroc_confidence_interval(all_labels, all_probs_ensemble)
-    # Save metrics as dict for ease of reporting csv
-    ensemble_metrics = {}
-    ensemble_metrics["acc"] = np.round(accuracy, 4)
-    ensemble_metrics["auc"] = np.round(auc, 4)
-    ensemble_metrics["f1"] = np.round(f1, 4)
-    ensemble_metrics["auroc_ci"] = np.round(ci, 4)
-    ensemble_metrics["tau"] = np.round(tau, 6)
+    ci = (
+        auroc_confidence_interval(all_labels, all_probs_ensemble)
+        if scores["auc"] is not None
+        else (None, None)
+    )
+    # Save metrics as dict for ease of reporting csv. Values are Python/native so the
+    # dict is strict-JSON safe: undefined single-class cells are None, never NaN.
+    ensemble_metrics = {
+        "acc": _rounded(scores["acc"]),
+        "auc": _rounded(scores["auc"]),
+        "f1": _rounded(scores["f1"]),
+        "auprc": _rounded(scores["auprc"]),
+        "sensitivity": _rounded(scores["sensitivity"]),
+        "specificity": _rounded(scores["specificity"]),
+        "prevalence": _rounded(scores["prevalence"]),
+        "n_pos": scores["n_pos"],
+        "n_neg": scores["n_neg"],
+        "auroc_ci": (
+            [_rounded(ci[0]), _rounded(ci[1])] if ci[0] is not None else None
+        ),
+        "tau": float(tau),
+    }
     # Log metrics
     logger.debug("\nEnsemble Evaluation Results:")
     logger.debug(f"Threshold tau: {tau}")
-    logger.debug(f"Accuracy: {accuracy:.4f}")
-    logger.debug(f"AUC: {auc:.4f}")
-    logger.debug(f"AUROC CI: {ci}")
-    logger.debug(f"F1: {f1:.4f}")
+    logger.debug(f"Accuracy: {ensemble_metrics['acc']}")
+    logger.debug(f"AUC: {ensemble_metrics['auc']}")
+    logger.debug(f"AUPRC (sklearn average precision): {ensemble_metrics['auprc']}")
+    logger.debug(f"Sensitivity: {ensemble_metrics['sensitivity']}")
+    logger.debug(f"Specificity: {ensemble_metrics['specificity']}")
+    logger.debug(f"Prevalence: {ensemble_metrics['prevalence']}")
+    logger.debug(f"AUROC CI: {ensemble_metrics['auroc_ci']}")
+    logger.debug(f"F1: {ensemble_metrics['f1']}")
     logger.debug(f"Confusion Matrix: {cm}")
     # Section 6.4: predictions are keyed by ImageId, in dataset order.
     pred_df = pd.DataFrame(
