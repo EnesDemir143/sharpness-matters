@@ -5,6 +5,7 @@ Check targets are named in the docstrings of the modules under test.
 """
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import pytest
 import torch
 from pytorch_lightning import LightningModule
 from torch import nn
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from sharpness_matters.config.load_config import cfg
 from sharpness_matters.ptx.corrected.cv_record import (
@@ -732,3 +733,136 @@ def test_validation_path_is_deterministic_and_train_path_is_not(tmp_path, ckpt_d
     assert not torch.equal(
         model.train_inputs_per_epoch[0][0], model.train_inputs_per_epoch[1][0]
     )
+
+
+# ------------------------------------------------------- OOF inference device
+
+
+class _DeviceRecordingModel(nn.Module):
+    """Records the device of every input it forwards (stand-in for the fold model)."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(1, 1)
+        self.seen_devices = []
+
+    def forward(self, x):
+        self.seen_devices.append(x.device)
+        pooled = x.flatten(1).mean(dim=1, keepdim=True)
+        return self.linear(pooled).squeeze(1)
+
+
+def _two_fold_setup(tmp_path):
+    labels = _development_labels()
+    fold_of_id = {
+        image_id: int(index >= len(labels) // 2)
+        for index, image_id in enumerate(labels)
+    }
+    manifest_path = tmp_path / "siim_folds.csv"
+    manifest = _manifest(manifest_path, fold_of_id, labels)
+    return labels, manifest, manifest_path
+
+
+def test_oof_predictor_is_given_the_trainer_root_device(
+    tmp_path, ckpt_dir, monkeypatch
+):
+    """The OOF pass must run on the device Lightning trained on, not the model's.
+
+    B: Lightning's `strategy.teardown()` moves the module to CPU when `fit` returns, so
+    reading `next(model.parameters()).device` scored the fold on CPU while training ran
+    on the GPU. The device is now passed in from `trainer.strategy.root_device`.
+    """
+    params = inspect.signature(train_kfold._predict_val_fold).parameters
+    assert "device" in params
+    assert params["device"].default is inspect.Parameter.empty
+
+    labels, manifest, manifest_path = _two_fold_setup(tmp_path)
+
+    trainers = []
+    real_trainer = train_kfold.Trainer
+
+    def recording_trainer(**kwargs):
+        trainer = real_trainer(**kwargs)
+        trainers.append(trainer)
+        return trainer
+
+    monkeypatch.setattr(train_kfold, "Trainer", recording_trainer)
+
+    recorded = []
+    real_predict = train_kfold._predict_val_fold
+
+    def spy(model, val_loader, device):
+        recorded.append((torch.device(device), next(model.parameters()).device))
+        return real_predict(model, val_loader, device)
+
+    monkeypatch.setattr(train_kfold, "_predict_val_fold", spy)
+
+    train_kfold.train_with_kfold(
+        TinyDataset(labels),
+        TinyDataset(labels),
+        k_folds=2,
+        num_epochs=1,
+        batch_size=4,
+        num_workers=0,
+        img_size=8,
+        fold_manifest=manifest,
+        fold_manifest_path=manifest_path,
+        model_name="dummy",
+        model_factory=_factory(),
+        trainer_kwargs=TRAINER_KWARGS,
+    )
+
+    root_devices = [trainer.strategy.root_device for trainer in trainers]
+    assert len(root_devices) == 2
+    assert all(device.type == "cpu" for device in root_devices)
+    assert [device for device, _ in recorded] == root_devices
+    # teardown left the module on CPU: the predictor must move it back itself
+    assert all(module_device.type == "cpu" for _, module_device in recorded)
+
+
+def test_predict_val_fold_runs_on_the_requested_device_cpu():
+    labels = _development_labels()
+    loader = DataLoader(
+        TinyDataset(labels), batch_size=4, shuffle=False, num_workers=0
+    )
+    model = _DeviceRecordingModel()
+
+    with pytest.raises(TypeError):
+        train_kfold._predict_val_fold(model, loader)  # device is mandatory
+
+    image_ids, probs = train_kfold._predict_val_fold(
+        model, loader, device=torch.device("cpu")
+    )
+    assert image_ids == list(labels)
+    assert probs.shape == (len(labels),)
+    assert np.isfinite(probs).all()
+    assert model.seen_devices and all(d.type == "cpu" for d in model.seen_devices)
+    assert next(model.parameters()).device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_predict_val_fold_moves_the_model_to_the_requested_cuda_device():
+    labels = _development_labels()
+    loader = DataLoader(
+        TinyDataset(labels), batch_size=4, shuffle=False, num_workers=0
+    )
+    model = _DeviceRecordingModel()  # starts on CPU, like after `teardown()`
+    assert next(model.parameters()).device.type == "cpu"
+
+    image_ids, gpu_probs = train_kfold._predict_val_fold(
+        model, loader, device=torch.device("cuda:0")
+    )
+    assert len(model.seen_devices) == 2
+    assert all(d.type == "cuda" for d in model.seen_devices)
+    assert image_ids == list(labels)
+    assert gpu_probs.shape == (len(labels),)
+    assert np.isfinite(gpu_probs).all()
+    # the module is put back on CPU so GPU memory does not carry over between folds
+    assert next(model.parameters()).device.type == "cpu"
+
+    model.seen_devices.clear()
+    _, cpu_probs = train_kfold._predict_val_fold(
+        model, loader, device=torch.device("cpu")
+    )
+    assert all(d.type == "cpu" for d in model.seen_devices)
+    np.testing.assert_allclose(gpu_probs, cpu_probs, rtol=0, atol=1e-3)

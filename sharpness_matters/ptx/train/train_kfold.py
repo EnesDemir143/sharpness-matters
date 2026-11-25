@@ -245,7 +245,7 @@ def _fold_indices(fold_of: Dict[str, int], image_ids: List[str], fold: int):
 
 
 def _predict_val_fold(
-    model: pl.LightningModule, val_loader: DataLoader
+    model: pl.LightningModule, val_loader: DataLoader, device: torch.device
 ) -> Tuple[List[str], np.ndarray]:
     """Sigmoid probabilities of the restored best checkpoint on one validation fold.
 
@@ -253,9 +253,16 @@ def _predict_val_fold(
     no per-image probability; problem -> fold AUROC, pooled OOF AUROC and the OOF
     threshold cannot be computed from the run; new behaviour -> probabilities are read
     from the restored best checkpoint in eval mode without gradients, keyed by ImageId.
+    B (OOF device): `strategy.teardown()` moves the module to CPU when `fit` returns, so
+    `next(model.parameters()).device` scored every fold on the CPU while training ran on
+    the GPU (~0.84 s/image, minutes per fold, GPU idle) and produced probabilities from a
+    different numeric path than the GPU evaluators. `device` is the trainer's root
+    device and is required; the module is moved there for the pass and back to CPU after
+    it, so GPU memory does not accumulate across folds.
     """
-    device = next(model.parameters()).device
+    device = torch.device(device)
     was_training = model.training
+    model.to(device)
     model.eval()
     image_ids: List[str] = []
     probs: List[float] = []
@@ -278,6 +285,10 @@ def _predict_val_fold(
                 image_ids.extend([str(pid) for pid in batch["pid"]])
     finally:
         model.train(was_training)
+        # B (OOF device): do not keep the fold's activations/weights on the GPU.
+        model.to(torch.device("cpu"))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return image_ids, np.asarray(probs, dtype=np.float64)
 
 
@@ -459,8 +470,12 @@ def train_with_kfold(
             )
 
         # 5.7/5.8: score the fold with the restored best checkpoint, not the last epoch.
+        # B (OOF device): `teardown()` already put the module back on CPU, so the OOF
+        # pass is told the device `fit` ran on instead of reading the module's device.
         model.load_state_dict(checkpoint["state_dict"])
-        pred_ids, probs = _predict_val_fold(model, val_loader)
+        pred_ids, probs = _predict_val_fold(
+            model, val_loader, trainer.strategy.root_device
+        )
         if len(pred_ids) != len(val_idx) or set(pred_ids) != {
             image_ids[idx] for idx in val_idx
         }:
