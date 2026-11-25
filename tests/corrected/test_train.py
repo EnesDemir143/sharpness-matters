@@ -253,6 +253,7 @@ def _fake_record(tmp_path, k_folds=2, model_name="dummy", img_size=8):
         "img_size": img_size,
         "k_folds": k_folds,
         "fold_manifest_sha256": "0" * 64,
+        "fold_manifest_provenance_version": 1,
         "folds": folds,
         "S_h": float(np.mean([entry["val_auroc"] for entry in folds])),
         "pooled_oof_auroc": 0.75,
@@ -300,6 +301,13 @@ def test_cv_record_load_raises_on_missing_fold(tmp_path, ckpt_dir):
 
     with pytest.raises(RuntimeError, match="fold indices"):
         load_cv_record("dummy", 8)
+
+
+def test_cv_record_write_rejects_wrong_provenance_version(tmp_path, ckpt_dir):
+    record, oof = _fake_record(tmp_path)
+    record["fold_manifest_provenance_version"] = 0
+    with pytest.raises(RuntimeError, match="provenance_version"):
+        write_cv_record(record, oof)
 
 
 def test_cv_record_write_rejects_missing_checkpoint_entry(tmp_path, ckpt_dir):
@@ -568,6 +576,90 @@ def test_train_with_kfold_end_to_end_writes_valid_record_and_oof(tmp_path, ckpt_
     assert fold_checkpoints(loaded) == [
         entry["checkpoint_path"] for entry in on_disk["folds"]
     ]
+
+
+def test_training_rejects_frame_that_does_not_match_hashed_manifest(
+    tmp_path, ckpt_dir
+):
+    """The cv record's fold_manifest_sha256 must describe the frame actually trained."""
+    labels = _development_labels()
+    fold_of_id = {
+        image_id: int(index >= len(labels) // 2)
+        for index, image_id in enumerate(labels)
+    }
+    manifest_path = tmp_path / "siim_folds.csv"
+    manifest = _manifest(manifest_path, fold_of_id, labels)
+
+    leaked = manifest.copy()
+    leaked.loc[0, "fold"] = (int(leaked.loc[0, "fold"]) + 1) % 2
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        train_kfold.train_with_kfold(
+            TinyDataset(labels),
+            TinyDataset(labels),
+            k_folds=2,
+            num_epochs=1,
+            batch_size=4,
+            num_workers=0,
+            img_size=8,
+            model_name="dummy",
+            fold_manifest=leaked,
+            fold_manifest_path=manifest_path,
+            model_factory=_factory(),
+            trainer_kwargs=TRAINER_KWARGS,
+        )
+
+    extra = pd.concat(
+        [
+            manifest,
+            pd.DataFrame({"image_id": ["held-out"], "label": [0], "fold": [0]}),
+        ],
+        ignore_index=True,
+    )
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        train_kfold.train_with_kfold(
+            TinyDataset(labels),
+            TinyDataset(labels),
+            k_folds=2,
+            num_epochs=1,
+            batch_size=4,
+            num_workers=0,
+            img_size=8,
+            model_name="dummy",
+            fold_manifest=extra,
+            fold_manifest_path=manifest_path,
+            model_factory=_factory(),
+            trainer_kwargs=TRAINER_KWARGS,
+        )
+
+
+def test_reordered_manifest_frame_matches_the_hashed_file(tmp_path, ckpt_dir):
+    """Row order is not provenance: the same ID/label/fold map trains and records."""
+    labels = _development_labels()
+    fold_of_id = {
+        image_id: int(index >= len(labels) // 2)
+        for index, image_id in enumerate(labels)
+    }
+    manifest_path = tmp_path / "siim_folds.csv"
+    manifest = _manifest(manifest_path, fold_of_id, labels)
+
+    record = train_kfold.train_with_kfold(
+        TinyDataset(labels),
+        TinyDataset(labels),
+        k_folds=2,
+        num_epochs=1,
+        batch_size=4,
+        num_workers=0,
+        img_size=8,
+        model_name="dummy",
+        fold_manifest=manifest.iloc[::-1].reset_index(drop=True),
+        fold_manifest_path=manifest_path,
+        model_factory=_factory(),
+        trainer_kwargs=TRAINER_KWARGS,
+    )
+    assert record["fold_manifest_sha256"] == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    assert record["fold_manifest_provenance_version"] == 1
 
 
 def test_default_manifest_loader_and_path_are_used(tmp_path, ckpt_dir, monkeypatch):

@@ -119,10 +119,13 @@ Steps 1–6 need no training. Step 7 trains and downloads ImageNet weights.
 uv run python -m sharpness_matters.ptx.corrected.data_checks --out reports/
 ```
 
-**2. SIIM fold manifest:** builds and freezes `manifests/siim_folds.csv` (StratifiedKFold, 5 folds, seed 42) or verifies it if it already exists.
+**2. SIIM manifests:** builds and freezes `manifests/siim_folds.csv` (StratifiedKFold, 5 folds, seed 42) or verifies it if it already exists, then freezes the internal holdout as the exact complement of that manifest inside `train-rle.csv`.
 ```bash
 uv run python -m sharpness_matters.ptx.corrected.make_fold_manifest
+uv run python -m sharpness_matters.ptx.corrected.make_siim_holdout
 ```
+
+`manifests/siim_holdout.csv` (`image_id,label`, 1068 images / 238 positive for the author split) is frozen with `.sha256` and `.record.json`; it records both the `siim_folds.csv` SHA-256 it was derived from and its own CSV SHA-256. Evaluation loads it by membership (CSV row order cannot change the cohort) and fails closed if it overlaps the development manifest bound to the run's `cv_record.json`, if that provenance is absent or mismatched, if the creation record lacks its `csv_sha256`, or if the holdout is not exactly the development complement. Training verifies that the fold frame it trains on equals the hashed file and records `fold_manifest_provenance_version` next to `fold_manifest_sha256`; older records (no version) are unverifiable and cannot evaluate the holdout.
 
 **3. Reference-like E5:** runs the unmodified author script `create_vin_dr_subset.py` once (fixed `PYTHONHASHSEED`) and freezes `manifests/reference_like_combined.csv`, both lists and `N_dup`.
 ```bash

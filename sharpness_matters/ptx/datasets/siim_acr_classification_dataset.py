@@ -74,6 +74,64 @@ def siim_labels_from_rle(label_df: pd.DataFrame) -> Dict[str, int]:
     return {image_id: int(value) for image_id, value in has_mask.items()}
 
 
+def siim_manifest_labels(
+    manifest_csv: Union[str, Path], label_df: pd.DataFrame
+) -> Tuple[List[str], Dict[str, int]]:
+    """IDs and labels of a frozen ``image_id,label`` cohort, verified against the RLE CSV.
+
+    The frozen manifest defines membership and label order; the training CSV is used
+    only as an order-independent rule lookup (``siim_labels_from_rle``), so reordering
+    ``train-rle.csv`` can never change which images or labels are evaluated. A missing
+    RLE row, a duplicated manifest ID, a non-binary label or a label that disagrees
+    with the RLE rule raises instead of being patched from either source.
+    """
+    frame = pd.read_csv(manifest_csv, dtype={"image_id": str})
+    missing_columns = [c for c in ("image_id", "label") if c not in frame.columns]
+    if missing_columns:
+        raise RuntimeError(
+            f"frozen SIIM cohort {manifest_csv} is missing columns {missing_columns}; "
+            "expected 'image_id,label'"
+        )
+    image_ids = [str(value) for value in frame["image_id"].tolist()]
+    duplicated = sorted(set(pd.Series(image_ids)[pd.Series(image_ids).duplicated()]))
+    if duplicated:
+        raise RuntimeError(
+            f"frozen SIIM cohort {manifest_csv} lists an image_id more than once: "
+            f"{duplicated[:5]}"
+        )
+    labels: Dict[str, int] = {}
+    invalid = []
+    for image_id, value in zip(image_ids, frame["label"].tolist()):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float("nan")
+        if numeric not in (0.0, 1.0):
+            invalid.append((image_id, value))
+            continue
+        labels[image_id] = int(numeric)
+    if invalid:
+        raise RuntimeError(
+            f"frozen SIIM cohort {manifest_csv} has non-binary labels, e.g. {invalid[:5]}"
+        )
+    rule_labels = siim_labels_from_rle(label_df)
+    missing_ids = sorted(image_id for image_id in image_ids if image_id not in rule_labels)
+    if missing_ids:
+        raise RuntimeError(
+            f"{len(missing_ids)} ImageId(s) of frozen SIIM cohort {manifest_csv} have no "
+            f"row in the RLE CSV, e.g. {missing_ids[:5]}"
+        )
+    mismatched = sorted(
+        image_id for image_id in image_ids if rule_labels[image_id] != labels[image_id]
+    )
+    if mismatched:
+        raise RuntimeError(
+            f"frozen SIIM cohort {manifest_csv} disagrees with the RLE CSV for "
+            f"{len(mismatched)} ImageId(s), e.g. {mismatched[:5]}"
+        )
+    return image_ids, labels
+
+
 class ChestXrayDataset(Dataset):
     """
     PyTorch Dataset for SIIM-ACR chest X-ray classification (binary pneumothorax detection).
@@ -88,6 +146,7 @@ class ChestXrayDataset(Dataset):
         transform: Optional[Any] = None,
         test_size: float = 0.1,
         split_seed: int = 42,
+        manifest_csv: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize SIIM-ACR chest X-ray classification dataset.
@@ -97,38 +156,51 @@ class ChestXrayDataset(Dataset):
         #   min-max. # B (PTX-26 / Section 5.3): the default preprocessing is the
         #   shared eval_transform policy. # B (Section 10.3 / Y10): ImageIds resolve
         #   through an exact filename-stem map built once here.
+        # B (Section 4.1 / 6.x): ``manifest_csv`` selects a frozen ``image_id,label``
+        #   cohort verbatim (membership and order from the manifest, labels checked
+        #   against the RLE rule) instead of re-running the author's split. The
+        #   internal holdout is evaluated this way, so reordering ``train-rle.csv``
+        #   cannot change the cohort.
 
         Args:
             file_paths (List[str]): List of paths to DICOM files
             label_dir (str): Path to CSV file with labels
             img_size (int): Target image size for resizing
-            split (str): Dataset split ('train' or 'test')
+            split (str): Dataset split ('train' or 'test'); ignored when
+                ``manifest_csv`` is given
             transform (Optional[Any]): Image transformations to apply
             test_size (float): Fraction of data for test split
             split_seed (int): Random seed for train/test split
+            manifest_csv (Optional[Union[str, Path]]): frozen ``image_id,label``
+                cohort that defines membership instead of a fresh split
         """
         self.file_paths = file_paths
         self.file_map, self.duplicate_ids = index_dicom_files(file_paths)
         label_df = pd.read_csv(label_dir)
-        image_id_arr = label_df["ImageId"].unique()
-        self.image_ids = list(image_id_arr)
-        self.labels = self.process_labels(label_df)
-
-        indices = np.arange(len(self.image_ids))
-        labels = [self.labels[i] for i in self.image_ids]
-        train_idx, test_idx = train_test_split(
-            indices,
-            stratify=labels,
-            test_size=test_size,
-            random_state=split_seed,
-        )
-        if split == "train":
-            indices = train_idx
+        if manifest_csv is not None:
+            self.image_ids, self.labels = siim_manifest_labels(
+                manifest_csv, label_df
+            )
         else:
-            indices = test_idx
-        self.image_ids = list(np.array(self.image_ids)[indices])
+            image_id_arr = label_df["ImageId"].unique()
+            self.image_ids = list(image_id_arr)
+            self.labels = self.process_labels(label_df)
+
+            indices = np.arange(len(self.image_ids))
+            labels = [self.labels[i] for i in self.image_ids]
+            train_idx, test_idx = train_test_split(
+                indices,
+                stratify=labels,
+                test_size=test_size,
+                random_state=split_seed,
+            )
+            if split == "train":
+                indices = train_idx
+            else:
+                indices = test_idx
+            self.image_ids = list(np.array(self.image_ids)[indices])
+            self.labels = {i: self.labels[i] for i in self.image_ids}
         require_unique_files(self.image_ids, self.file_map, self.duplicate_ids)
-        self.labels = {i: self.labels[i] for i in self.image_ids}
         pos, neg = 0, 0
         for val in self.labels.values():
             if val == 1:

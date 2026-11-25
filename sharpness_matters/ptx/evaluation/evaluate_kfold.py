@@ -81,9 +81,15 @@ from sharpness_matters.ptx.corrected.frozen import (
     manifest_dir,
     sha256_file,
 )
+from sharpness_matters.ptx.corrected.cv_record import load_cv_record
 from sharpness_matters.ptx.corrected.eval_manifests import (
     load_e5_manifest,
     verify_dataset_against_frozen,
+)
+from sharpness_matters.ptx.corrected.make_fold_manifest import FOLD_MANIFEST_NAME
+from sharpness_matters.ptx.corrected.make_siim_holdout import (
+    HOLDOUT_MANIFEST_NAME,
+    load_and_verify_holdout,
 )
 from sharpness_matters.ptx.corrected.make_chexlocalize import (
     CLS_MANIFEST_NAME as CHEXLOCALIZE_CLS_MANIFEST,
@@ -191,17 +197,56 @@ def fetch_results_per_resolution(
     # None appends. The E2-wide row pins split/label_any between source and label.
     extra_columns: List[Tuple[Optional[int], str, list]] = []
     label_any_labels: Optional[np.ndarray] = None
+    record_for_eval: Optional[Dict[str, Any]] = None
     # Extract training files required to initialize dataset
     if validation_mode == "holdout":
+        # B (§4.1 / §6): the internal holdout is a frozen ID+label cohort, verified as
+        # the complement of the development manifest the checkpoints were trained on.
+        # Membership comes from the manifest, never from re-running train_test_split.
+        label_csv = f"{DATA_DIR}/train-rle.csv"
+        holdout_csv = Path(manifest_dir()) / HOLDOUT_MANIFEST_NAME
+        record_for_eval = load_cv_record(model_name, img_size)
+        frozen_holdout = load_and_verify_holdout(
+            record_for_eval,
+            label_csv,
+            holdout_path=holdout_csv,
+            development_manifest=Path(manifest_dir()) / FOLD_MANIFEST_NAME,
+        )
         train_dicom_dir = os.path.join(DATA_DIR, "dicom-images-train")
         train_glob = f"{train_dicom_dir}/*/*/*.dcm"
         train_names = [f for f in sorted(glob.glob(train_glob))]
         dataset = ChestXrayDataset(
-            train_names, f"{DATA_DIR}/train-rle.csv", split="test", img_size=img_size
+            train_names,
+            label_csv,
+            split="test",
+            img_size=img_size,
+            manifest_csv=str(holdout_csv),
         )
         ids = list(dataset.image_ids)
-        sources = ["siim_acr"] * len(ids)
+        frozen_ids = [str(value) for value in frozen_holdout["image_id"]]
+        if ids != frozen_ids:
+            raise RuntimeError(
+                "holdout loader order differs from the frozen manifest: "
+                f"{len(ids)} dataset ids vs {len(frozen_ids)} manifest ids"
+            )
+        frozen_labels = {
+            str(image_id): int(label)
+            for image_id, label in zip(
+                frozen_holdout["image_id"], frozen_holdout["label"]
+            )
+        }
         expected = [int(dataset.labels[i]) for i in ids]
+        mismatched = [
+            image_id
+            for image_id in ids
+            if frozen_labels[image_id] != int(dataset.labels[image_id])
+        ]
+        if mismatched:
+            raise RuntimeError(
+                f"holdout loader labels differ from the frozen manifest for "
+                f"{len(mismatched)} ids, e.g. {mismatched[:5]}"
+            )
+        sources = ["siim_acr"] * len(ids)
     elif validation_mode in ("ood_reference_like", "ood_clean"):
         if not e5_manifest:
             raise ValueError(
@@ -348,6 +393,7 @@ def fetch_results_per_resolution(
         logger,
         ids=ids,
         labels=np.asarray(expected, dtype=int),
+        record=record_for_eval,
     )
     # Stage 1 / Section 6.4: verify the ID order and labels match the dataset order
     if len(ids) != len(pred_df):

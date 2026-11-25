@@ -21,6 +21,7 @@ from sharpness_matters.ptx.datasets.siim_acr_classification_dataset import (
     index_dicom_files,
     require_unique_files,
     siim_labels_from_rle,
+    siim_manifest_labels,
 )
 from sharpness_matters.config.load_config import cfg
 
@@ -104,6 +105,7 @@ class ChestXrayDataset(Dataset):
         transform: Optional[Any] = None,
         test_size: float = 0.1,
         split_seed: int = 42,
+        manifest_csv: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize SIIM-ACR chest X-ray dataset.
@@ -114,39 +116,62 @@ class ChestXrayDataset(Dataset):
         #   (PTX-26 / Section 5.3): default preprocessing is eval_transform. # B
         #   (Section 7.4 / Y4 and Section 10.3 / Y10): `pid`/`image_id` are the
         #   ImageId and files resolve by exact filename stem.
-        #   check: tests/corrected/test_data.py::test_siim_masked_loader_*
+        # B (Section 4.1 / 6.x): ``manifest_csv`` fixes the cohort to a frozen
+        #   ``image_id,label`` list and its order; the RLE CSV is only a
+        #   mask/label lookup, so annotation reordering cannot change membership.
+        #   check: tests/corrected/test_data.py::test_siim_masked_loader_*,
+        #   tests/corrected/test_siim_holdout.py::test_*
 
         Args:
             file_paths (List[str]): List of paths to DICOM files
             label_dir (str): Path to CSV file with labels
             img_size (int): Target image size for resizing
-            split (str): Dataset split ('train' or 'test')
+            split (str): Dataset split ('train' or 'test'); ignored when
+                ``manifest_csv`` is given
             transform (Optional[Any]): Image transformations to apply
             test_size (float): Fraction of data for test split
             split_seed (int): Random seed for train/test split
+            manifest_csv (Optional[Union[str, Path]]): frozen ``image_id,label``
+                cohort that defines membership instead of a fresh split
         """
         self.file_paths = file_paths
         self.file_map, self.duplicate_ids = index_dicom_files(file_paths)
         label_df = pd.read_csv(label_dir)
-        image_id_arr = label_df["ImageId"].unique()
-        self.image_ids = list(image_id_arr)
-        label_lookup = siim_labels_from_rle(label_df)
-
-        labels = [label_lookup[i] for i in self.image_ids]
-        indices = np.arange(len(self.image_ids))
-        train_idx, test_idx = train_test_split(
-            indices,
-            stratify=labels,
-            test_size=test_size,
-            random_state=split_seed,
-        )
-        if split == "train":
-            indices = train_idx
+        if manifest_csv is not None:
+            self.image_ids, manifest_labels = siim_manifest_labels(
+                manifest_csv, label_df
+            )
         else:
-            indices = test_idx
-        self.image_ids = list(np.array(self.image_ids)[indices])
+            image_id_arr = label_df["ImageId"].unique()
+            self.image_ids = list(image_id_arr)
+            label_lookup = siim_labels_from_rle(label_df)
+
+            labels = [label_lookup[i] for i in self.image_ids]
+            indices = np.arange(len(self.image_ids))
+            train_idx, test_idx = train_test_split(
+                indices,
+                stratify=labels,
+                test_size=test_size,
+                random_state=split_seed,
+            )
+            if split == "train":
+                indices = train_idx
+            else:
+                indices = test_idx
+            self.image_ids = list(np.array(self.image_ids)[indices])
         require_unique_files(self.image_ids, self.file_map, self.duplicate_ids)
         self.labels = self.process_labels(label_df, self.image_ids)
+        if manifest_csv is not None:
+            mismatched = sorted(
+                image_id
+                for image_id in self.image_ids
+                if self.labels[image_id]["label"] != manifest_labels[image_id]
+            )
+            if mismatched:
+                raise RuntimeError(
+                    f"masked SIIM loader disagrees with frozen cohort {manifest_csv} "
+                    f"for {len(mismatched)} ImageId(s), e.g. {mismatched[:5]}"
+                )
         pos, neg = 0, 0
         for i in self.labels.values():
             val = i["label"]

@@ -30,6 +30,7 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset, Dataset
 
 from sharpness_matters.ptx.corrected.cv_record import (
+    FOLD_MANIFEST_PROVENANCE_VERSION,
     file_sha256,
     run_dir,
     write_cv_record,
@@ -176,6 +177,62 @@ def _fold_of_image(
     return dict(zip(manifest_ids, folds))
 
 
+def _manifest_index(frame: pd.DataFrame, source: str) -> Dict[str, Tuple[int, int]]:
+    """Unique image_id -> (label, fold) for a fold manifest frame, or raise."""
+    missing = [c for c in ("image_id", "label", "fold") if c not in frame.columns]
+    if missing:
+        raise RuntimeError(
+            f"{source} is missing columns {missing}; expected 'image_id,label,fold'"
+        )
+    index: Dict[str, Tuple[int, int]] = {}
+    for image_id, label, fold in zip(
+        frame["image_id"], frame["label"], frame["fold"]
+    ):
+        key = str(image_id)
+        if key in index:
+            raise RuntimeError(f"{source} lists an image_id more than once: {key}")
+        try:
+            index[key] = (int(label), int(fold))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"{source} has a non-integer label/fold for {key}: "
+                f"{label!r}, {fold!r}"
+            ) from error
+    return index
+
+
+def _check_fold_manifest_matches_file(
+    fold_manifest: pd.DataFrame, manifest_path: Path
+) -> None:
+    """Prove the frame used for training is the file whose SHA-256 is recorded.
+
+    B (§4.1 / §5.5-§5.8): the cv record binds ``fold_manifest_sha256`` from the file,
+    so training must not accept an independently supplied frame. A caller could bind
+    a disjoint file while training on different (e.g. holdout) IDs; comparing the
+    image_id -> (label, fold) maps closes that gap. Row order and extra columns are
+    irrelevant.
+    """
+    on_disk = pd.read_csv(manifest_path, dtype={"image_id": str})
+    recorded = _manifest_index(on_disk, f"fold manifest file {manifest_path}")
+    supplied = _manifest_index(fold_manifest, "in-memory fold manifest")
+    if supplied == recorded:
+        return
+    only_supplied = sorted(set(supplied) - set(recorded))
+    only_file = sorted(set(recorded) - set(supplied))
+    changed = sorted(
+        image_id
+        for image_id in set(supplied) & set(recorded)
+        if supplied[image_id] != recorded[image_id]
+    )
+    raise RuntimeError(
+        "fold manifest provenance mismatch: the frame passed to training does not "
+        f"match {manifest_path} (whose sha256 is written to the cv record); "
+        f"ids only in frame {only_supplied[:5]}, ids only in file {only_file[:5]}, "
+        f"changed label/fold {changed[:5]}. Refusing to train on a frame that is not "
+        "the recorded manifest."
+    )
+
+
 def _fold_indices(fold_of: Dict[str, int], image_ids: List[str], fold: int):
     """Dataset-order indices of one fold's validation and training members."""
     val_idx = [idx for idx, image_id in enumerate(image_ids) if fold_of[image_id] == fold]
@@ -304,6 +361,7 @@ def train_with_kfold(
     if not manifest_path.is_file():
         raise RuntimeError(f"fold manifest file not found: {manifest_path}")
     fold_manifest_sha256 = file_sha256(manifest_path)
+    _check_fold_manifest_matches_file(fold_manifest, manifest_path)
 
     fold_of = _fold_of_image(fold_manifest, image_ids, labels, k_folds)
     factory = _default_model_factory if model_factory is None else model_factory
@@ -474,6 +532,9 @@ def train_with_kfold(
         "img_size": int(img_size),
         "k_folds": k_folds,
         "fold_manifest_sha256": fold_manifest_sha256,
+        # Set only after `_check_fold_manifest_matches_file` proved the frame trained
+        # on is the hashed file; readers require this version for holdout evaluation.
+        "fold_manifest_provenance_version": FOLD_MANIFEST_PROVENANCE_VERSION,
         "folds": fold_records,
         "S_h": float(np.mean([entry["val_auroc"] for entry in fold_records])),
         "pooled_oof_auroc": pooled_oof_auroc,

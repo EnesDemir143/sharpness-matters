@@ -11,7 +11,7 @@ from scipy.stats import norm
 import scipy.stats as st
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
 from tqdm import tqdm
-from typing import Dict, List, Optional, Tuple, Union, Type
+from typing import Any, Dict, List, Optional, Tuple, Union, Type
 from sharpness_matters.ptx.corrected.cv_record import fold_checkpoints, load_cv_record
 
 # B (PTX-18 / PTX-07, Section 6.1): current -> the fold checkpoint was discovered with
@@ -199,6 +199,7 @@ def eval_res(
     logger,
     ids: List[str],
     labels: Optional[np.ndarray] = None,
+    record: Optional[Dict[str, Any]] = None,
 ):
     """
     Evaluate a cross-validated classification model and aggregate ensemble metrics.
@@ -222,6 +223,9 @@ def eval_res(
     labels : Optional[np.ndarray]
         Expected labels in dataset order. When omitted, they are taken from the
         dataset's `labels` dict if it has one.
+    record : Optional[Dict[str, Any]]
+        Already loaded and verified cv record (the holdout path loads it to verify
+        provenance first); reloaded when omitted.
     Returns
     -------
     pred_df : pd.DataFrame
@@ -237,7 +241,8 @@ def eval_res(
         )
     # Checkpoints and the operating threshold come from the run's cv record, which
     # verifies every fold is present and every recorded sha256 matches (Section 6.1).
-    record = load_cv_record(model_name, img_size)
+    if record is None:
+        record = load_cv_record(model_name, img_size)
     checkpoints = fold_checkpoints(record)
     k_folds = len(checkpoints)
     if int(record["k_folds"]) != k_folds:

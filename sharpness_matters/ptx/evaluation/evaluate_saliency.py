@@ -38,6 +38,12 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Any, List, Optional, Tuple, Union
 
 from sharpness_matters.ptx.corrected.cv_record import fold_checkpoints, load_cv_record
+from sharpness_matters.ptx.corrected.frozen import manifest_dir
+from sharpness_matters.ptx.corrected.make_fold_manifest import FOLD_MANIFEST_NAME
+from sharpness_matters.ptx.corrected.make_siim_holdout import (
+    HOLDOUT_MANIFEST_NAME,
+    load_and_verify_holdout,
+)
 from sharpness_matters.ptx.datasets.siim_acr_dataset import ChestXrayDataset
 from sharpness_matters.ptx.models.cnn import CNNBinaryClassifier
 from sharpness_matters.ptx.utils.logging_utils import initialize_logger
@@ -110,6 +116,7 @@ def run_experiment(
     save_maps: bool = True,
     output_dir: Optional[str] = None,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    record: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Run saliency evaluation experiment for the holdout dataset with specified model and parameters.
@@ -124,11 +131,15 @@ def run_experiment(
         save_maps (bool): Write the author's map visualisations under `ptx/output`
         output_dir (Optional[str]): directory of the per-run CSV/JSON; defaults to
             `output/saliency_eval/{model_name}`
+        record (Optional[Dict[str, Any]]): already loaded/verified cv record (the
+            holdout entry point verifies frozen holdout provenance with it);
+            reloaded when omitted
 
     Returns:
         Dict[str, Dict[str, Any]]: one result per fold-aggregation rule (`main`, `legacy`)
     """
-    record = load_cv_record(model_name, img_size)
+    if record is None:
+        record = load_cv_record(model_name, img_size)
     checkpoints = fold_checkpoints(record)
     checkpoint_sha256s = fold_checkpoint_shas(record)
     if len(checkpoints) != len(checkpoint_sha256s):
@@ -197,20 +208,53 @@ if __name__ == "__main__":
     train_dicom_dir = os.path.join(DATA_DIR, "dicom-images-train")
     train_glob = f"{train_dicom_dir}/*/*/*.dcm"
     train_names = [f for f in sorted(glob.glob(train_glob))]
+    label_csv = f"{DATA_DIR}/train-rle.csv"
+    holdout_csv = Path(manifest_dir()) / HOLDOUT_MANIFEST_NAME
 
     dataset_name = "siim_holdout"
     model_names = ["resnet", "densenet"]
     output_root = f"{HOME}/output/saliency_eval"
     for model_name in model_names:
+        # B (§4.1 / §6): the saliency cohort is the same frozen holdout as the
+        # classification run; provenance and disjointness are proven before loading.
+        record = load_cv_record(model_name, 512)
+        frozen_holdout = load_and_verify_holdout(
+            record,
+            label_csv,
+            holdout_path=holdout_csv,
+            development_manifest=Path(manifest_dir()) / FOLD_MANIFEST_NAME,
+        )
         table_rows = {RULE_MAIN: [], RULE_LEGACY: []}
         for img_size in [512]:  # B (protocol §6): B evaluates 512 only
             torch.cuda.empty_cache()
             dataset = ChestXrayDataset(
                 train_names,
-                f"{DATA_DIR}/train-rle.csv",
+                label_csv,
                 split="test",
                 img_size=img_size,
+                manifest_csv=str(holdout_csv),
             )
+            frozen_ids = [str(value) for value in frozen_holdout["image_id"]]
+            if list(dataset.image_ids) != frozen_ids:
+                raise RuntimeError(
+                    "holdout saliency loader order differs from the frozen manifest"
+                )
+            frozen_labels = {
+                str(image_id): int(label)
+                for image_id, label in zip(
+                    frozen_holdout["image_id"], frozen_holdout["label"]
+                )
+            }
+            mismatched = [
+                image_id
+                for image_id in frozen_ids
+                if int(dataset.labels[image_id]["label"]) != frozen_labels[image_id]
+            ]
+            if mismatched:
+                raise RuntimeError(
+                    f"holdout saliency loader labels differ from the frozen manifest "
+                    f"for {len(mismatched)} ids, e.g. {mismatched[:5]}"
+                )
             logger.info(f"Running: Image size: {img_size}, Model: {model_name}")
             results = run_experiment(
                 dataset,
@@ -220,6 +264,7 @@ if __name__ == "__main__":
                 validation_mode="holdout",
                 chunk_size=10,
                 output_dir=f"{output_root}/{model_name}",
+                record=record,
             )
             for rule in (RULE_MAIN, RULE_LEGACY):
                 table_rows[rule].extend(summary_table(results[rule]))
