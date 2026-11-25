@@ -143,11 +143,12 @@ def load_or_create_frozen(
     """Load a frozen csv, or build and freeze it once.
 
     States (contract module 1):
-      * csv + ``<path>.sha256`` exist and the hash matches -> load the csv, no rebuild;
-      * neither exists -> ``build_fn()``, then write csv, hash and creation record;
-      * anything else (csv without hash, hash without csv, hash mismatch, record
-        without csv) -> ``RuntimeError``. Frozen artifacts are never rebuilt or
-        overwritten silently.
+      * csv + ``<path>.sha256`` + ``<path>.record.json`` all exist and the hash matches
+        -> load the csv, no rebuild;
+      * none of the three exists -> ``build_fn()``, then write csv, hash and record;
+      * anything else (any one of the three missing, e.g. csv + sha256 without record,
+        hash mismatch) -> ``RuntimeError`` naming the missing file(s). Frozen artifacts
+        are never rebuilt or overwritten silently.
 
     ID columns (``image_id``/``*_id``/``id``) are read back as strings.
     """
@@ -156,8 +157,9 @@ def load_or_create_frozen(
     record_file = record_path(path)
     csv_exists = path.exists()
     hash_exists = hash_file.exists()
+    record_exists = record_file.exists()
 
-    if csv_exists and hash_exists:
+    if csv_exists and hash_exists and record_exists:
         expected = hash_file.read_text(encoding="utf-8").split()[0]
         actual = sha256_file(path)
         if actual != expected:
@@ -167,12 +169,13 @@ def load_or_create_frozen(
             )
         return pd.read_csv(path, dtype=_id_dtypes(path))
 
-    if csv_exists or hash_exists or record_file.exists():
+    if csv_exists or hash_exists or record_exists:
         present = [str(p.name) for p in (path, hash_file, record_file) if p.exists()]
+        missing = [str(p.name) for p in (path, hash_file, record_file) if not p.exists()]
         raise RuntimeError(
-            f"Inconsistent frozen manifest state for {path}: present {present}. "
-            "A frozen manifest needs the csv, its .sha256 and its .record.json "
-            "together; refusing to rebuild silently."
+            f"Inconsistent frozen manifest state for {path}: present {present}, "
+            f"missing {missing}. A frozen manifest needs the csv, its .sha256 and its "
+            ".record.json together; refusing to rebuild silently."
         )
 
     frame = build_fn()
