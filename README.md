@@ -82,6 +82,7 @@ This project uses five public datasets:
 - **Source**: [Kaggle Competition](https://www.kaggle.com/c/vinbigdata-chest-xray-abnormalities-detection)
 - **Images**: ~18,000 chest X-rays
 - **Format**: DICOM files
+- **Preprocessing**: the stage-2 loader honors `PhotometricInterpretation`; a `MONOCHROME1` file is inverted to `MONOCHROME2` polarity before per-image min-max.
 
 ### PTX498 Dataset
 - **Source**: [DeepSDM](https://github.com/wangyunpengbio/DeepSDM)

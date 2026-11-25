@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 from torchvision import transforms
 
 from sharpness_matters.config.load_config import cfg
@@ -64,6 +66,45 @@ class FakeNifti:
 
     def get_fdata(self):
         return self._data
+
+
+def write_vindr_dicom(path: Path, pixels, photometric: str) -> Path:
+    """Write a minimal uncompressed 16-bit DICOM for the VinDr loader."""
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    dicom = FileDataset(
+        str(path),
+        {},
+        file_meta=file_meta,
+        preamble=b"\x00" * 128,
+        is_implicit_VR=False,
+        is_little_endian=True,
+    )
+    pixels = np.asarray(pixels, dtype=np.uint16)
+    dicom.Rows, dicom.Columns = pixels.shape
+    dicom.SamplesPerPixel = 1
+    dicom.PhotometricInterpretation = photometric
+    dicom.BitsAllocated = 16
+    dicom.BitsStored = 16
+    dicom.HighBit = 15
+    dicom.PixelRepresentation = 0
+    dicom.PixelData = pixels.tobytes()
+    dicom.save_as(str(path), write_like_original=False)
+    return path
+
+
+def vin_single_image_dataset(
+    tmp_path: Path, name: str, pixels, photometric: str, img_size: int
+) -> VinDataset:
+    """One-image VinDataset rooted at a real synthetic DICOM."""
+    root = tmp_path / f"{name}_root"
+    root.mkdir()
+    write_vindr_dicom(root / f"{name}.dicom", pixels, photometric)
+    manifest = tmp_path / f"{name}_manifest.csv"
+    pd.DataFrame({"image_id": [name], "label": [0]}).to_csv(manifest, index=False)
+    return VinDataset(manifest_csv=str(manifest), root_dir=str(root), img_size=img_size)
 
 
 def write_siim_label_csv(
@@ -891,6 +932,43 @@ def test_vin_manifest_default_transform_is_eval_transform(tmp_path):
     dataset = VinDataset(manifest_csv=str(manifest), img_size=32)
     names = [type(step).__name__ for step in dataset.transform.transforms]
     assert names == ["ToTensor", "Resize"]
+
+
+def test_vin_monochrome1_matches_monochrome2_displayed_intensities(tmp_path):
+    """A MONOCHROME1 file must reach the consumer with MONOCHROME2 polarity.
+
+    The two fixtures show the same picture: MONOCHROME1 displays low stored values
+    white, so its stored values are the MONOCHROME2 ones reversed.
+    """
+    monochrome2 = np.arange(16, dtype=np.uint16).reshape(4, 4)
+    monochrome1 = monochrome2.max() - monochrome2
+    ds2 = vin_single_image_dataset(tmp_path, "m2", monochrome2, "MONOCHROME2", 4)
+    ds1 = vin_single_image_dataset(tmp_path, "m1", monochrome1, "MONOCHROME1", 4)
+
+    data2 = ds2[0]["data"]
+    data1 = ds1[0]["data"]
+    assert data2.shape == data1.shape == (1, 4, 4)
+    assert torch.allclose(data1, data2, atol=1e-6)
+
+
+def test_vin_monochrome2_pixels_unchanged(tmp_path):
+    pixels = np.array(
+        [[0, 3, 7, 15], [1, 2, 4, 8], [5, 6, 9, 14], [10, 11, 12, 13]],
+        dtype=np.uint16,
+    )
+    dataset = vin_single_image_dataset(tmp_path, "m2", pixels, "MONOCHROME2", 4)
+    expected = torch.from_numpy(
+        (pixels / pixels.max()).astype(np.float32)
+    ).unsqueeze(0)
+    assert torch.allclose(dataset[0]["data"], expected, atol=1e-6)
+
+
+def test_vin_constant_monochrome1_is_finite_zero(tmp_path):
+    pixels = np.full((4, 4), 7, dtype=np.uint16)
+    dataset = vin_single_image_dataset(tmp_path, "m1", pixels, "MONOCHROME1", 4)
+    data = dataset[0]["data"]
+    assert torch.isfinite(data).all()
+    assert torch.count_nonzero(data) == 0
 
 
 # ------------------------------------------------------------- demographics

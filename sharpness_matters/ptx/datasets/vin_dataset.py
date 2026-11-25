@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+from typing import Optional, Tuple
+
 import torch
 from torch.utils.data import Dataset
 import pydicom
@@ -103,15 +105,16 @@ class VinDataset(Dataset):
         }
 
     @staticmethod
-    def load_dicom(file_path: str) -> np.ndarray:
+    def load_dicom(file_path: str) -> Tuple[np.ndarray, Optional[str]]:
         """
-        Load a DICOM file and extract the pixel array.
+        Load a DICOM file and decode it to a MONOCHROME2-polarity pixel array.
 
         Parameters:
         - file_path (str): Path to the DICOM file.
 
         Returns:
-        - numpy.ndarray: The pixel data as a NumPy array.
+        - tuple: The float32 pixel data with display polarity normalised, and the
+          patient ID.
         """
         dicom = pydicom.dcmread(file_path)
         dicom.BitsStored = (
@@ -121,6 +124,16 @@ class VinDataset(Dataset):
         image = dicom.pixel_array  # Get the raw pixel data
         # image = apply_voi_lut(dicom.pixel_array, dicom)
         image = image.astype(np.float32)
+        # B: DICOM MONOCHROME1 displays low stored values as white, the opposite of
+        #   MONOCHROME2. Negating here (before min-max in __getitem__) restores the
+        #   displayed intensities, so an inverted file no longer enters the pipeline
+        #   upside down. A constant image stays constant and min-max maps it to 0.
+        photometric = dicom.get("PhotometricInterpretation", None)
+        if (
+            photometric is not None
+            and str(photometric).strip().upper() == "MONOCHROME1"
+        ):
+            image = -image
         return image, patient_id
 
     def extract_demographics(self, image_id: str) -> dict:
