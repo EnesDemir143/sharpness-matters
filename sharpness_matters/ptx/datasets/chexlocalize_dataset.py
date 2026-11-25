@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
+import cv2
 import numpy as np
 import pandas as pd
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -313,6 +315,71 @@ class CheXlocalizeDataset(Dataset):
                 f"image grid {tuple(native_shape)}; the mask is never resized"
             )
         return mask
+
+    def visualize_segmentation(
+        self,
+        image: Union[np.ndarray, torch.Tensor],
+        mask: Union[np.ndarray, torch.Tensor],
+        alpha: float = 0.5,
+        mask_color: Tuple[float, float, float] = (1, 0, 0),
+    ) -> np.ndarray:
+        """Overlay a binary mask on the image at the mask's full resolution.
+
+        # B (protocol Section 4.4 E4): current -> the CheXlocalize loader had no
+        #   `visualize_segmentation`, so the scorer's default `save_maps=True` crashed
+        #   in `_save_map_visualisations` before writing any map; problem -> E4 visuals
+        #   could only be produced by suppressing them; new -> the same author
+        #   convention as the SIIM/PTX-498 loaders: the ``[0, 1]`` HWC RGB image is
+        #   resized to the mask grid with cubic interpolation (so a native, non-square
+        #   mask is rendered at full resolution), a 2-D mask becomes ``mask_color``
+        #   where it is positive, and `cv2.addWeighted` returns a uint8 RGB overlay.
+        #   The scorer passes a torch ``(H, W, 3)`` display-grid image and a 2-D
+        #   ``0/255`` thresholded map; numpy arrays are accepted too.
+        #   check: tests/corrected/test_chexlocalize.py::test_save_maps_*
+
+        Args:
+            image: Base image ``(H, W, 3)`` in ``[0, 1]``; torch tensor or numpy array
+            mask: ``(h, w)`` binary mask (`{0, 1}` GT or `0/255` CAM) or an
+                ``(h, w, 3)`` RGB mask; torch tensor or numpy array
+            alpha: Opacity of the mask overlay in ``[0, 1]``
+            mask_color: RGB colour applied to a binary mask's foreground
+
+        Returns:
+            np.ndarray: uint8 ``(h, w, 3)`` RGB image with the mask overlaid on the
+            mask's grid.
+        """
+        if torch.is_tensor(image):
+            image = image.detach().cpu().numpy()
+        if torch.is_tensor(mask):
+            mask = mask.detach().cpu().numpy()
+        image = np.asarray(image)
+        mask = np.asarray(mask)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(f"image must be (H, W, 3) RGB, got shape {image.shape}")
+        if mask.ndim not in (2, 3):
+            raise ValueError(f"mask must be (H, W) or (H, W, 3), got {mask.shape}")
+        if mask.ndim == 3 and mask.shape[2] != 3:
+            raise ValueError(f"an RGB mask must be (H, W, 3), got {mask.shape}")
+        if image.shape[:2] != mask.shape[:2]:
+            # Display-grid image -> mask grid; a no-op for the scorer's equal grids,
+            # the native-resolution path for a mask on the image's original grid.
+            image = cv2.resize(
+                np.ascontiguousarray(image),
+                dsize=(int(mask.shape[1]), int(mask.shape[0])),
+                interpolation=cv2.INTER_CUBIC,
+            )
+            # INTER_CUBIC can ring past the [0, 1] range at sharp edges; clamping
+            # keeps a cast to uint8 from wrapping highlights and shadows.
+            image = np.clip(image, 0.0, 1.0)
+        image = (np.asarray(image) * 255).astype(np.uint8)
+        if mask.ndim == 2:
+            foreground = np.where(mask > 0, 255, 0).astype(np.uint8)
+            colored_mask = np.zeros_like(image, dtype=np.uint8)
+            for channel in range(3):
+                colored_mask[..., channel] = foreground * mask_color[channel]
+        else:
+            colored_mask = np.asarray(mask, dtype=np.uint8)
+        return cv2.addWeighted(image, 1 - alpha, colored_mask, alpha, 0)
 
     def __len__(self) -> int:
         return len(self.image_ids)

@@ -8,9 +8,11 @@ check the production decoder, including a hand-made literal vector.
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from PIL import Image
 
 from sharpness_matters.config.load_config import cfg
@@ -26,7 +28,12 @@ from sharpness_matters.ptx.datasets.chexlocalize_dataset import (
     view_from_path,
 )
 from sharpness_matters.ptx.evaluation import evaluate_saliency_chexlocalize as eval_chx
-from sharpness_matters.ptx.utils.saliency_eval import RULE_LEGACY, RULE_MAIN
+from sharpness_matters.ptx.utils.saliency_eval import (
+    RULE_LEGACY,
+    RULE_MAIN,
+    compute_scores_chunked,
+    save_fold_chunk,
+)
 
 
 # --- reference pycocotools encoder (independent of the production decoder) ---
@@ -317,6 +324,167 @@ def test_dataset_rejects_mask_grid_mismatch(tmp_path):
     dataset = _dataset(fixture, manifest, with_mask=True)
     with pytest.raises(RuntimeError, match="does not match"):
         dataset[1]
+
+
+# --- saliency visualisation (default save_maps=True) ---
+
+
+def _cv_record(tau: float = 0.5) -> dict:
+    k_folds = int(cfg.ptx.corrected.k_folds)
+    shas = [f"sha{fold}" for fold in range(k_folds)]
+    return {
+        "k_folds": k_folds,
+        "tau": tau,
+        "folds": [{"fold": fold, "sha256": shas[fold]} for fold in range(k_folds)],
+    }
+
+
+def _write_fold_chunks(cache_dir, items, probs, cams, record, chunk_size=2):
+    """Write the chunk set a completed `predict_fold_chunked` run leaves behind."""
+    image_ids = [item["image_id"] for item in items]
+    shas = [entry["sha256"] for entry in record["folds"]]
+    for chunk_index, start in enumerate(range(0, len(image_ids), chunk_size)):
+        chunk_ids = image_ids[start : start + chunk_size]
+        for fold in range(record["k_folds"]):
+            save_fold_chunk(
+                cache_dir,
+                fold,
+                chunk_index,
+                {image_id: probs[image_id] for image_id in chunk_ids},
+                {image_id: cams[image_id][fold] for image_id in chunk_ids},
+                shas[fold],
+            )
+
+
+def test_save_maps_default_writes_native_resolution_overlays(tmp_path, monkeypatch):
+    """Default `save_maps=True` renders E4 maps through the real CheXlocalize loader.
+
+    Regression for the E4 crash: `_save_map_visualisations` calls
+    `dataset.visualize_segmentation`, so the loader must implement it. The synthetic
+    image and GT mask are non-square (24x40) while the model input grid is 32x32; the
+    three author visualisations must be written, and the loader must render a
+    native-grid mask at its full resolution with a uint8 RGB binary overlay.
+    """
+    from sharpness_matters.ptx.utils import saliency_eval as scorer
+
+    fixture = _Fixture(tmp_path)
+    image_id = "patient3_study1_view1_frontal"
+    path = "val/patient3/study1/view1_frontal.jpg"
+    height, width = 24, 40
+    _write_jpg(fixture.chexpert / path, height=height, width=width)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[6:14, 10:22] = 1
+    _write_segmentations(
+        fixture.annotations / "gt_segmentations_val.json", {image_id: mask}
+    )
+    manifest = tmp_path / "manifest.csv"
+    pd.DataFrame(
+        {
+            "image_id": [image_id],
+            "split": ["val"],
+            "patient_id": ["patient3"],
+            "path": [path],
+            "label": [1],
+        }
+    ).to_csv(manifest, index=False)
+    dataset = _dataset(fixture, manifest, img_size=32, with_mask=True)
+
+    item = dataset[0]
+    assert tuple(item["data"].shape) == (1, 32, 32)
+    assert item["mask"].shape == (height, width)
+
+    record = _cv_record()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    cam = np.zeros((8, 8, 1), dtype=np.float32)
+    cam[2, 3, 0] = 1.0
+    _write_fold_chunks(
+        cache_dir,
+        [item],
+        {image_id: 0.9},
+        {image_id: [cam.copy() for _ in range(record["k_folds"])]},
+        record,
+    )
+    monkeypatch.setattr(scorer, "HOME", tmp_path)
+
+    # No `save_maps` argument: exercise the default True.
+    scorer.compute_scores_chunked(
+        dataset,
+        str(cache_dir),
+        record,
+        "resnet",
+        32,
+        "chexlocalize",
+        chunk_size=2,
+    )
+
+    base = tmp_path / "output" / "resnet_maps" / "maps_holdout" / "maps_32"
+
+    def _written(name: str) -> np.ndarray:
+        written = base / name / f"{image_id}.jpg"
+        assert written.is_file()
+        overlay = np.asarray(Image.open(written).convert("RGB"))
+        assert overlay.dtype == np.uint8
+        assert overlay.shape == (32, 32, 3)
+        return overlay
+
+    # GT is rendered by `visualize_segmentation`: the red binary mask overlay.
+    gt_overlay = _written("gt")
+    assert np.any(
+        (gt_overlay[..., 0] > gt_overlay[..., 1])
+        & (gt_overlay[..., 0] > gt_overlay[..., 2])
+    )
+    # `sm` is the author's JET CAM heatmap over the image, not the red mask overlay:
+    # require a valid, non-grayscale heatmap contribution instead of a red pixel.
+    sm_overlay = _written("sm")
+    assert np.any(
+        (sm_overlay[..., 0] != sm_overlay[..., 1])
+        | (sm_overlay[..., 1] != sm_overlay[..., 2])
+    )
+    # Thresholded predictions use the red binary overlay again; the lowest threshold
+    # selects the synthetic CAM peak, so a red-dominant pixel is required there.
+    thresholds = [float(value) for value in cfg.ptx.corrected.saliency_thresholds]
+    for threshold in thresholds:
+        assert (base / f"masks_{threshold}" / f"{image_id}.jpg").is_file()
+    predicted_overlay = _written(f"masks_{min(thresholds)}")
+    assert np.any(
+        (predicted_overlay[..., 0] > predicted_overlay[..., 1])
+        & (predicted_overlay[..., 0] > predicted_overlay[..., 2])
+    )
+
+    # Full native resolution: the display-grid image is brought to the non-square
+    # native mask grid with cubic interpolation, and the overlay stays uint8 RGB.
+    display = item["data"].permute(1, 2, 0).repeat(1, 1, 3)
+    native_overlay = dataset.visualize_segmentation(
+        display, torch.from_numpy(mask.astype(np.float32) * 255.0)
+    )
+    assert native_overlay.shape == (height, width, 3)
+    assert native_overlay.dtype == np.uint8
+    foreground = mask > 0
+    assert (
+        native_overlay[..., 0][foreground] > native_overlay[..., 1][foreground]
+    ).all()
+    background = ~foreground
+    assert (
+        native_overlay[..., 0][background] == native_overlay[..., 1][background]
+    ).all()
+
+    # Sharp-edge cubic overshoot must clamp before the uint8 cast: a wrap would put
+    # dark pixels next to the white block instead of the expected saturated highlight.
+    edge = np.zeros((5, 7, 3), dtype=np.float32)
+    edge[:, :3] = 1.0
+    edge[:2, 3] = 1.0
+    sharp = dataset.visualize_segmentation(
+        edge, np.zeros((11, 9), dtype=np.float32), alpha=0.0
+    )
+    reference = (
+        np.clip(
+            cv2.resize(edge, (9, 11), interpolation=cv2.INTER_CUBIC), 0.0, 1.0
+        )
+        * 255
+    ).astype(np.uint8)
+    np.testing.assert_array_equal(sharp, reference)
+    assert int(sharp[..., 0].max()) == 255
 
 
 # --- manifest builder ---
