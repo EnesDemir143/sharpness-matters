@@ -353,36 +353,76 @@ def build_chexlocalize_manifests(
     return cls_all, xai_all, counts
 
 
+def _artifact_files(path: Path) -> Tuple[Path, Path, Path]:
+    """The three files a frozen artifact consists of."""
+    return (path, hash_path(path), record_path(path))
+
+
+def _manifest_record(
+    select: str, counts: Dict[str, Any], source_hashes: Dict[str, str]
+) -> Dict[str, Any]:
+    """Creation record written with one CheXlocalize manifest csv."""
+    return {
+        "item": f"E4 CheXlocalize {select} manifest (protocol Section 4.4)",
+        "rule": (
+            "frontal views with CheXpert Pneumothorax in {0,1}"
+            if select == "cls"
+            else "frontal views with label 1 and a non-empty decoded "
+            "Pneumothorax GT whose grid equals the image grid"
+        ),
+        "label_column": LABEL_COLUMN,
+        "splits": list(SPLITS),
+        "counts": counts,
+        "source_sha256": source_hashes,
+    }
+
+
+def _build_and_freeze_pair(select: str) -> pd.DataFrame:
+    """Build both cohorts once from the label CSVs and freeze both manifests."""
+    cls_frame, xai_frame, counts = build_chexlocalize_manifests()
+    source_hashes = _source_hashes()
+    frames = {"cls": cls_frame, "xai": xai_frame}
+    for kind, frame in frames.items():
+        load_or_create_frozen(
+            manifest_dir() / (CLS_MANIFEST_NAME if kind == "cls" else XAI_MANIFEST_NAME),
+            lambda frame=frame: frame,
+            _manifest_record(kind, counts, source_hashes),
+        )
+    return frames[select]
+
+
 def _load_manifest(name: str, select: str) -> pd.DataFrame:
-    """Load one frozen manifest first; build both once only when absent."""
+    """Load one frozen manifest; build the pair only when both artifacts are absent.
+
+    The cls and xai manifests are one frozen pair (protocol Section 4.7):
+      * both entirely absent -> build once and freeze both together;
+      * this artifact present -> load it (its own partial state still raises);
+      * this artifact entirely absent while the sibling is present (frozen or partial)
+        -> ``RuntimeError``: readers never rebuild one half from a partial data
+        directory; delete or rebuild both deliberately.
+    """
     path = manifest_dir() / name
-    frozen_state = any(
-        candidate.exists() for candidate in (path, hash_path(path), record_path(path))
-    )
-    record: Dict[str, Any] = {}
-    if frozen_state:
-        def _build():  # pragma: no cover - only reached for a broken frozen state
-            raise RuntimeError(f"Frozen CheXlocalize manifest {path} is incomplete")
+    sibling_name = XAI_MANIFEST_NAME if name == CLS_MANIFEST_NAME else CLS_MANIFEST_NAME
+    sibling_path = manifest_dir() / sibling_name
+    files = _artifact_files(path)
+    sibling_files = _artifact_files(sibling_path)
+    if not any(candidate.exists() for candidate in files):
+        if any(candidate.exists() for candidate in sibling_files):
+            raise RuntimeError(
+                f"CheXlocalize manifests are in a partial state: {sibling_path.name} "
+                f"is present but {path.name} is absent. The classification and XAI "
+                "manifests are frozen together, and readers never rebuild one half "
+                "from a partial data directory. Delete or rebuild BOTH manifests "
+                "deliberately (python -m "
+                "sharpness_matters.ptx.corrected.make_chexlocalize)."
+            )
+        frame = _build_and_freeze_pair(select)
     else:
-        record = {
-            "item": f"E4 CheXlocalize {select} manifest (protocol Section 4.4)",
-            "rule": (
-                "frontal views with CheXpert Pneumothorax in {0,1}"
-                if select == "cls"
-                else "frontal views with label 1 and a non-empty decoded "
-                "Pneumothorax GT whose grid equals the image grid"
-            ),
-            "label_column": LABEL_COLUMN,
-            "splits": list(SPLITS),
-        }
 
-        def _build():
-            cls_frame, xai_frame, counts = build_chexlocalize_manifests()
-            record["counts"] = counts
-            record["source_sha256"] = _source_hashes()
-            return cls_frame if select == "cls" else xai_frame
+        def _refuse_rebuild():  # pragma: no cover - broken frozen state only
+            raise RuntimeError(f"Frozen CheXlocalize manifest {path} is incomplete")
 
-    frame = load_or_create_frozen(path, _build, record)
+        frame = load_or_create_frozen(path, _refuse_rebuild, {})
     frame["label"] = frame["label"].astype(int)
     return frame
 
